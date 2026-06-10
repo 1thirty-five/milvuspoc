@@ -1,4 +1,4 @@
-# Milvus vector store POC
+# Milvus vector db POC
 
 Stores text in a Milvus vector database using a sentence-transformer model.
 Embeds documents, inserts them into Milvus, and runs a semantic search to verify.
@@ -36,23 +36,14 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-In VS Code: `Ctrl+Shift+P` -> "Python: Select Interpreter" -> pick the `.venv` one.
-
 ### 3. Run
 
 ```bash
 python store_in_milvus.py
 ```
 
-You should see the model load, 5 documents inserted, and a ranked search result.
 
 ## Notes
 
 - The embedding model (`all-MiniLM-L6-v2`, ~80MB) downloads automatically on first run and is cached locally.
-- The script drops and recreates the collection on each run so it's safe to re-run. Remove the `drop_collection` block once you want data to persist.
-- To use your own data, replace the `documents` list in `store_in_milvus.py`.
 
-## What does NOT live in git
-
-The `.venv` folder, Milvus data (`volumes/`), and the model cache are gitignored.
-Each device recreates these locally via the steps above.
