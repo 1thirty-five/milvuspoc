@@ -39,7 +39,7 @@ pip install -r requirements.txt
 ### 3. Run
 
 ```bash
-python store_in_milvus.py
+python loadmilvus.py
 ```
 
 
