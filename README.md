@@ -1,8 +1,12 @@
 # Milvus vector db POC
 
-Embeds text with a sentence-transformer model (`all-MiniLM-L6-v2`) and **stores**
-it in a Milvus vector database. Scope is the storing pipeline only — embed
-documents and insert their vectors into Milvus (semantic search is a later phase).
+Embeds text with a sentence-transformer model and **stores** it in a Milvus
+vector database. Scope is the storing pipeline only — embed documents and insert
+their vectors into Milvus (semantic search is a later phase).
+
+The embedding model is chosen per run with `--model` (see [Choosing a model](#choosing-a-model)),
+so the same pipeline can demo different sentence-transformers. The default is
+`minilm` (`all-MiniLM-L6-v2`, 384-dim).
 
 ## Prerequisites
 
@@ -34,10 +38,9 @@ docker compose logs -f      # follow logs
 docker compose down         # stop & remove the container (data is kept)
 docker compose down -v      # also wipe the data volume (clean slate)
 
-use   -restart
-docker compose down -v
-docker compose up -d
-docker compose ps 
+# full restart with a clean slate
+docker compose down -v && docker compose up -d && docker compose ps
+```
 
 The container and its data persist, so after the first run you just
 `docker compose up -d` again whenever you want Milvus back.
@@ -79,7 +82,7 @@ Then run:
 
 ```bash
 python loadmilvus.py          # shows an 8-value preview of each vector
-python loadmilvus.py --full   # prints the full 384-dim vectors
+python loadmilvus.py --full   # also writes full vectors to result.py + refreshes statistics.md
 ```
 
 This embeds the documents, prints the raw vectors the model produced, and stores
@@ -87,12 +90,41 @@ them in the `documents` collection. The collection is rebuilt each run
 (`reset=True`), so `input.md` is the single source of truth — editing and
 re-running never creates duplicates.
 
+### Choosing a model
+
+Pick the embedding model for a run with `--model`; one model is used for the
+whole run. List the built-in presets with `--list-models`:
+
+```bash
+python loadmilvus.py --list-models
+python loadmilvus.py                  # default preset: minilm (384-dim)
+python loadmilvus.py --model bge-m3   # BAAI/bge-m3 (1024-dim)
+```
+
+| Preset | Hugging Face id | Dim |
+|--------|-----------------|-----|
+| `minilm` (default) | `sentence-transformers/all-MiniLM-L6-v2` | 384 |
+| `bge-m3` | `BAAI/bge-m3` | 1024 |
+
+Any other `--model` value is used as a literal Hugging Face model id, so you can
+try a model without adding a preset. You can also set `MILVUS_MODEL` as the
+default instead of passing the flag. Presets live in `MODEL_PRESETS` in
+`loadmilvus.py` — add an entry to register a new one (an optional `doc_prefix` /
+`trust_remote_code` per preset covers models that need them, e.g. nomic-embed).
+
+There's a single `documents` collection, rebuilt each run at the chosen model's
+dimension, so **switching models replaces the previously stored data** (only one
+model's vectors live in Milvus at a time). Larger models (bge-m3) download a few
+GB on first use and, on a CPU-only PyTorch install, embed noticeably slower than
+minilm.
+
 ## Benchmarks
 
 `benchmark.py` measures the storing pipeline and writes `statistics.md`:
 
 ```bash
-python benchmark.py
+python benchmark.py                 # default model (minilm)
+python benchmark.py --model bge-m3  # benchmark a specific preset / HF id
 ```
 
 Captured metrics: cold-start costs (model load, connect, collection+index create,
@@ -112,4 +144,4 @@ vectors.
 
 ## Notes
 
-- The embedding model (`all-MiniLM-L6-v2`, ~80MB) downloads automatically on first run and is cached locally. It produces 384-dimensional vectors.
+- The default embedding model (`all-MiniLM-L6-v2`, ~80MB, 384-dim) downloads automatically on first run and is cached locally. Other models selected with `--model` download on first use — see [Choosing a model](#choosing-a-model).

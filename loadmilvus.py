@@ -25,6 +25,7 @@ Then edit input.md with the text to index, and run:
                                    # regenerate statistics.md (no terminal dump)
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -34,9 +35,39 @@ from sentence_transformers import SentenceTransformer
 # Defaults — a UI can override any of these per call.
 DEFAULT_URI = "http://localhost:19530"
 DEFAULT_COLLECTION = "documents"
-DEFAULT_MODEL = "all-MiniLM-L6-v2"
 DEFAULT_INPUT = "input.md"
 DEFAULT_RESULT = "result.py"
+
+# Named model presets — pick one per run with `--model <key>` (see main()).
+# Each entry needs an "id" (the Hugging Face model id); these optional keys let a
+# preset carry model-specific needs without touching the pipeline:
+#   "trust_remote_code": True   -> passed to SentenceTransformer() at load
+#   "doc_prefix": "..."         -> prepended to every document before embedding
+#                                  (e.g. nomic-embed needs "search_document: ")
+# A `--model` value that isn't a key here is treated as a literal HF id with no
+# special handling, so you can try any model without editing this dict.
+MODEL_PRESETS = {
+    "minilm": {"id": "sentence-transformers/all-MiniLM-L6-v2"},
+    "bge-m3": {"id": "BAAI/bge-m3"},
+}
+
+# Default preset key for a plain run. minilm (384-dim) keeps cold start fast.
+DEFAULT_MODEL = "minilm"
+
+
+def resolve_model(name=DEFAULT_MODEL):
+    """Resolve a preset key (or raw HF id) to (hf_id, load_kwargs, doc_prefix).
+
+    If `name` is a key in MODEL_PRESETS, its config is used; otherwise `name` is
+    treated as a literal Hugging Face model id with no special handling.
+    """
+    preset = MODEL_PRESETS.get(name)
+    if preset is None:
+        return name, {}, ""
+    load_kwargs = {}
+    if preset.get("trust_remote_code"):
+        load_kwargs["trust_remote_code"] = True
+    return preset["id"], load_kwargs, preset.get("doc_prefix", "")
 
 
 def load_inputs(path=DEFAULT_INPUT):
@@ -97,9 +128,17 @@ def load_inputs(path=DEFAULT_INPUT):
 
 
 def get_model(name=DEFAULT_MODEL):
-    """Load and return the sentence-transformer embedding model."""
-    print(f"Loading embedding model '{name}'...")
-    model = SentenceTransformer(name)
+    """Load and return the sentence-transformer embedding model.
+
+    `name` is a MODEL_PRESETS key (e.g. "bge-m3") or a literal HF model id. Any
+    document prefix the preset requires is stashed on the returned model as
+    `model.doc_prefix` so embed() can apply it transparently.
+    """
+    hf_id, load_kwargs, doc_prefix = resolve_model(name)
+    label = f"'{name}' ({hf_id})" if name != hf_id else f"'{hf_id}'"
+    print(f"Loading embedding model {label}...")
+    model = SentenceTransformer(hf_id, **load_kwargs)
+    model.doc_prefix = doc_prefix
     print(f"Model loaded. Embedding dimension = {get_dim(model)}")
     return model
 
@@ -158,8 +197,14 @@ def ensure_collection(client, dim, collection=DEFAULT_COLLECTION, reset=False):
 
 
 def embed(model, texts):
-    """Return normalized embeddings for a list of texts."""
-    return model.encode(list(texts), normalize_embeddings=True)
+    """Return normalized embeddings for a list of texts.
+
+    If the model was loaded with a document prefix (model.doc_prefix, set by
+    get_model for presets that require one), it is prepended to each text.
+    """
+    prefix = getattr(model, "doc_prefix", "")
+    texts = [prefix + t for t in texts] if prefix else list(texts)
+    return model.encode(texts, normalize_embeddings=True)
 
 
 def store(client, model, documents, collection=DEFAULT_COLLECTION, embeddings=None):
@@ -215,16 +260,44 @@ def write_results(documents, embeddings, path=DEFAULT_RESULT):
     print(f"Wrote {len(documents)} sentence/vector pairs to {path}.")
 
 
+def parse_model_arg(argv, default=DEFAULT_MODEL):
+    """Read the model name from `--model <name>` in argv.
+
+    Falls back to the MILVUS_MODEL env var, then `default`. Accepts a preset key
+    or a raw HF id (resolve_model handles either).
+    """
+    if "--model" in argv:
+        i = argv.index("--model")
+        if i + 1 >= len(argv):
+            raise SystemExit("--model needs a value, e.g. --model bge-m3")
+        return argv[i + 1]
+    return os.environ.get("MILVUS_MODEL", default)
+
+
+def list_models():
+    """Print the available model presets and exit."""
+    print("Available model presets (--model <key>):")
+    for key, cfg in MODEL_PRESETS.items():
+        default = "  (default)" if key == DEFAULT_MODEL else ""
+        print(f"  {key:<10} {cfg['id']}{default}")
+    print("Any other --model value is used as a literal Hugging Face model id.")
+
+
 def main():
     """Storing flow: embed the docs from input.md, show the raw vectors, store them."""
+    if "--list-models" in sys.argv:
+        list_models()
+        return
+
     full = "--full" in sys.argv
+    model_name = parse_model_arg(sys.argv)
 
     documents, _ = load_inputs(DEFAULT_INPUT)
     if not documents:
         raise SystemExit(f"No documents found in {DEFAULT_INPUT}. Add some under a '# Documents' heading.")
     print(f"Loaded {len(documents)} documents from {DEFAULT_INPUT}.")
 
-    model = get_model()
+    model = get_model(model_name)
 
     # Embed once; show a short preview (never the full vectors), reuse for storage.
     embeddings = embed(model, documents)
@@ -237,7 +310,7 @@ def main():
         write_results(documents, embeddings)
         print("\nRegenerating benchmark statistics (statistics.md)...")
         import benchmark   # lazy import to avoid a circular dependency
-        benchmark.main()
+        benchmark.main(model_name)
 
     client = connect()
     # reset=True makes input.md the single source of truth: each run rebuilds the
