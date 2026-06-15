@@ -1,0 +1,41 @@
+# Milvus standalone for the POC.
+#
+#   docker compose up -d        # start Milvus (first run pulls the image)
+#   docker compose ps           # wait for STATUS = healthy
+#   docker compose logs -f      # follow logs
+#   docker compose down         # stop & remove the container (keeps data)
+#   docker compose down -v      # also wipe the data volume (clean slate)
+#
+# Milvus listens on localhost:19530 — the URI loadmilvus.py connects to.
+#
+# Data lives in the `milvus_data` NAMED VOLUME (inside the Docker VM), NOT a
+# Windows bind-mount. The embedded etcd needs fast fsync; bind-mounting to the
+# Windows host filesystem makes etcd time out and Milvus panics on boot.
+services:
+  milvus:
+    image: milvusdb/milvus:v2.6.18
+    container_name: milvus-standalone
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_USE_EMBED: "true"
+      ETCD_DATA_DIR: /var/lib/milvus/etcd
+      ETCD_CONFIG_PATH: /milvus/configs/embedEtcd.yaml
+      COMMON_STORAGETYPE: local
+      DEPLOY_MODE: STANDALONE
+    volumes:
+      - milvus_data:/var/lib/milvus
+      - ./embedEtcd.yaml:/milvus/configs/embedEtcd.yaml
+      - ./user.yaml:/milvus/configs/user.yaml
+    ports:
+      - "19530:19530"   # gRPC / SDK
+      - "9091:9091"     # health & metrics
+      - "2379:2379"     # embedded etcd
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 10s
+      start_period: 90s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  milvus_data:

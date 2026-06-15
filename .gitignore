@@ -225,3 +225,7 @@ standalone_embed.sh
 embedEtcd.yaml
 user.yaml
 volumes/
+
+# Generated output
+result.py
+statistics.md
