@@ -90,6 +90,28 @@ them in the `documents` collection. The collection is rebuilt each run
 (`reset=True`), so `input.md` is the single source of truth — editing and
 re-running never creates duplicates.
 
+### Ingesting PDFs (and other documents)
+
+Instead of typing documents into `input.md`, drop files into the `fileinput/`
+folder and ingest the whole folder with PyMuPDF:
+
+```bash
+python extractpdf.py                  # preview the chunks from every file in fileinput/
+python extractpdf.py --store          # embed + store the whole folder in Milvus
+python extractpdf.py --store --model bge-m3
+python extractpdf.py file.pdf --out input.md   # one file -> input.md bullets instead
+```
+
+Each file's text is split into chunks that fit Milvus's `VARCHAR(2048)` `text`
+field (`--max-chars`, default 1500; `--overlap`, default 200, repeats a little
+text across chunk boundaries). Every chunk is stored with its source filename in
+the collection's dynamic `source` field, so you can tell which document a result
+came from. PyMuPDF also opens XPS/EPUB/MOBI/FB2/CBZ/TXT. Scanned/image-only PDFs
+have no text layer and extract empty — that needs OCR (see `pdf-extractors.md`).
+Like `loadmilvus.py`, `--store` rebuilds the collection each run, so the folder
+is the single source of truth (no duplicates). The folder's contents are
+git-ignored; only a `.gitkeep` is committed.
+
 ### Choosing a model
 
 Pick the embedding model for a run with `--model`; one model is used for the
@@ -138,6 +160,8 @@ vectors.
 |------|---------|
 | `loadmilvus.py` | Embed text from `input.md` and store it in Milvus (modular functions: `get_model`, `connect`, `ensure_collection`, `embed`, `store`). |
 | `input.md` | The documents to index (bullets under `# Documents`). |
+| `extractpdf.py` | Extract text from documents in `fileinput/` with PyMuPDF, chunk it, and store it in Milvus (`get_model`, `extract_chunks`, `extract_records`, `store_records`). |
+| `fileinput/` | Drop PDFs (and other PyMuPDF formats) here for `extractpdf.py` to ingest; contents are git-ignored. |
 | `benchmark.py` | Measure storing-pipeline latency/throughput → `statistics.md`. |
 | `statistics.md` | Generated benchmark results. |
 | `requirements.txt` | Python dependencies (`pymilvus`, `sentence-transformers`). |

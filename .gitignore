@@ -229,3 +229,7 @@ volumes/
 # Generated output
 result.py
 statistics.md
+
+# Input documents to ingest (extractpdf.py) — keep the folder, ignore its files
+fileinput/*
+!fileinput/.gitkeep
