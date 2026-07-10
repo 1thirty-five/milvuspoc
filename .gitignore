@@ -229,6 +229,7 @@ volumes/
 # Generated output
 result.py
 statistics.md
+clusters.html
 
 # Input documents to ingest (extractpdf.py) — keep the folder, ignore its files
 fileinput/*

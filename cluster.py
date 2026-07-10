@@ -169,6 +169,15 @@ def parse_k_arg(argv, default=DEFAULT_K):
 
 def main():
     """Fetch vectors from Milvus, cluster them, print groups, store labels back."""
+    # Cluster members are extracted document text, which can hold characters
+    # outside the terminal's legacy code page (e.g. math glyphs like the sqrt
+    # sign in "sqrt(dk)"). Don't let print_clusters crash the run on a Windows
+    # cp1252 console; replace anything unencodable. (Same guard as extractpdf.py.)
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
     k = parse_k_arg(sys.argv)
 
     client = connect()

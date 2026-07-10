@@ -51,8 +51,9 @@ MODEL_PRESETS = {
     "bge-m3": {"id": "BAAI/bge-m3"},
 }
 
-# Default preset key for a plain run. minilm (384-dim) keeps cold start fast.
-DEFAULT_MODEL = "minilm"
+# Default preset key for a plain run. bge-m3 (1024-dim) is the default embedding
+# model; pass `--model minilm` for the lighter 384-dim model (faster cold start).
+DEFAULT_MODEL = "bge-m3"
 
 
 def resolve_model(name=DEFAULT_MODEL):
@@ -178,13 +179,19 @@ def ensure_collection(client, dim, collection=DEFAULT_COLLECTION, reset=False):
     schema.add_field("text", DataType.VARCHAR, max_length=2048)
     schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=dim)
 
-    # COSINE works well with normalized sentence embeddings.
+    # HNSW: graph-based ANN index, low-latency high-recall lookups for an
+    # in-memory collection. COSINE matches the L2-normalized sentence embeddings
+    # (HNSW supports COSINE, so retrieval still ranks by cosine similarity).
+    # Build params:
+    #   M              -> edges per node in the graph (higher = better recall, more RAM)
+    #   efConstruction -> candidate list size while building (higher = better graph, slower build)
+    # The search-time `ef` param is set per-query when search is added (later phase).
     index_params = client.prepare_index_params()
     index_params.add_index(
         field_name="embedding",
-        index_type="IVF_FLAT",
+        index_type="HNSW",
         metric_type="COSINE",
-        params={"nlist": 128},
+        params={"M": 16, "efConstruction": 200},
     )
 
     client.create_collection(
@@ -243,7 +250,10 @@ def show_vectors(documents, embeddings, preview=8):
 
 
 def write_results(documents, embeddings, path=DEFAULT_RESULT):
-    """Write each sentence + its full 384-dim vector to a Python file.
+    """Write each sentence + its full embedding vector to a Python file.
+
+    The vector length matches the active model's dimension (bge-m3 1024,
+    minilm 384); it is taken from the embeddings themselves, not hardcoded.
 
     The file defines `results`, a list of {"text": ..., "vector": [...]} dicts,
     so it can be imported: `from result import results`.
