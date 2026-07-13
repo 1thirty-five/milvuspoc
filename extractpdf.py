@@ -29,10 +29,15 @@ OCR, which is out of scope here (see the OCR add-on note in pdf-extractors.md).
 Prerequisites:
     pip install pymupdf            # or: pip install -r requirements.txt
 
+Storing is incremental: a chunk already in Milvus (matched by a hash of its
+model + text) keeps its stored vector instead of being embedded again, so adding
+one file to fileinput/ only costs that file's chunks. See store_records.
+
 Run:
     python extractpdf.py                          # preview chunks from fileinput/
     python extractpdf.py --store                  # embed + store the whole folder
     python extractpdf.py --store --model bge-m3
+    python extractpdf.py --store --reset          # ignore the cache, rebuild from scratch
     python extractpdf.py file.pdf                 # a single file instead of the folder
     python extractpdf.py file.pdf --out input.md  # write chunks as documents
 """
@@ -266,32 +271,76 @@ def parse_path_arg(argv, default):
     return default
 
 
-def store_records(records, model_name):
-    """Embed every record's text and store it (with its source) in Milvus.
+def store_records(records, model_name, reset=False):
+    """Embed the records Milvus doesn't already have, and store them.
 
-    Mirrors loadmilvus's storing flow but adds a per-row `source` field (the
-    collection has dynamic fields enabled, so it's stored alongside text +
-    vector). reset=True rebuilds the collection from this batch, matching
-    loadmilvus's "input is the single source of truth" behavior (no duplicates).
+    Embedding is the expensive stage (a full fileinput/ run is ~1000 chunks), so
+    it is skipped wherever possible. Each chunk's (model, text) hash is its cache
+    key; any hash already in the collection was embedded on an earlier run and
+    its vector is reused as-is. Adding one PDF to fileinput/ therefore only costs
+    the embedding of that PDF's chunks, not a re-embed of the whole folder.
+
+    The collection still ends up mirroring the input exactly, as the old
+    reset=True behavior did: chunks that vanished from the input (their file was
+    edited or removed) are deleted. Pass reset=True to force a full rebuild.
     """
-    # Imported lazily so plain extraction/preview doesn't pull in torch/pymilvus.
-    from loadmilvus import connect, embed, ensure_collection, get_dim, get_model
+    # Imported lazily so plain extraction/preview doesn't pull in pymilvus.
+    from loadmilvus import (DEFAULT_COLLECTION, connect, content_hash, embed,
+                            ensure_collection, fetch_cached, get_dim, get_model,
+                            resolve_model)
 
-    texts = [r["text"] for r in records]
-    model = get_model(model_name)
-    print(f"Embedding {len(texts)} chunks...")
-    embeddings = embed(model, texts)
+    # The cache key is the model's *id*, which resolve_model gives us without
+    # loading any weights -- so the whole probe below (hash, look up, diff) runs
+    # before the model is touched. On a full cache hit we return without ever
+    # paying for it. Using the resolved id, not `model_name`, means the `bge-m3`
+    # alias and its full HF id hash alike instead of missing each other.
+    hf_id = resolve_model(model_name)[0]
+    for r in records:
+        r["chunk_hash"] = content_hash(hf_id, r["text"])
+    wanted = {r["chunk_hash"] for r in records}
 
     client = connect()
-    ensure_collection(client, dim=get_dim(model), reset=True)
+    cached = {} if reset else fetch_cached(client, DEFAULT_COLLECTION)
+
+    # Rows whose chunk is no longer in the input folder, and chunks the cache
+    # doesn't have. `fresh` is deduped by hash, so a chunk repeated across (or
+    # within) files is embedded and stored once.
+    stale = [row_id for h, row_id in cached.items() if h not in wanted]
+    fresh = {}
+    for r in records:
+        if r["chunk_hash"] not in cached:
+            fresh.setdefault(r["chunk_hash"], r)
+
+    hits = len(wanted) - len(fresh)
+    print(f"{hits}/{len(wanted)} chunks already embedded (cache hit); "
+          f"{len(fresh)} to embed, {len(stale)} to drop.")
+    if not reset and not fresh and not stale:
+        print("Collection already matches the input — nothing to do.")
+        return 0
+
+    # Only now, with real work to do, do we pay to load the model.
+    model = get_model(model_name)
+    ensure_collection(client, dim=get_dim(model), reset=reset)
+
+    if stale:
+        client.delete(collection_name=DEFAULT_COLLECTION, ids=stale)
+        print(f"Dropped {len(stale)} chunks no longer present in the input.")
+    if not fresh:
+        client.flush(DEFAULT_COLLECTION)
+        return 0
+
+    new_records = list(fresh.values())
+    embeddings = embed(model, [r["text"] for r in new_records])
     rows = [
-        {"text": r["text"], "embedding": emb.tolist(), "source": r["source"]}
-        for r, emb in zip(records, embeddings)
+        {"text": r["text"], "embedding": emb.tolist(),
+         "source": r["source"], "chunk_hash": r["chunk_hash"]}
+        for r, emb in zip(new_records, embeddings)
     ]
-    result = client.insert(collection_name="documents", data=rows)
-    client.flush("documents")
-    print(f"Inserted {result['insert_count']} chunks "
+    result = client.insert(collection_name=DEFAULT_COLLECTION, data=rows)
+    client.flush(DEFAULT_COLLECTION)
+    print(f"Inserted {result['insert_count']} new chunks "
           f"from {len({r['source'] for r in records})} files.")
+    return result["insert_count"]
 
 
 def main():
@@ -324,7 +373,8 @@ def main():
 
     if "--store" in sys.argv:
         from loadmilvus import parse_model_arg
-        store_records(records, parse_model_arg(sys.argv))
+        store_records(records, parse_model_arg(sys.argv),
+                      reset="--reset" in sys.argv)
         print("\nDone. Chunks embedded and stored in Milvus.")
     elif not out:
         print("\nPreview only. Re-run with --out input.md to save, or "

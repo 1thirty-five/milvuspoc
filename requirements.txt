@@ -1,6 +1,18 @@
 # Direct dependencies for the Milvus POC.
 # Tested versions (2026-06-10): pymilvus 2.4.0, sentence-transformers 5.5.1
 # (which pulls in torch 2.12.0, transformers 5.10.2, numpy 2.4.6).
+#
+# GPU NOTE: installing this file gives you the CPU build of torch, because that
+# is what PyPI serves. Embedding is by far the slowest stage of the pipeline and
+# it runs ~14x faster on a GPU (all 1072 chunks of fileinput/ with bge-m3: ~370s
+# on CPU vs ~26s on an RTX 3050). If you have an NVIDIA card, install the CUDA
+# build over the top -- same torch version, just compiled against CUDA 12.6:
+#
+#     pip install --index-url https://download.pytorch.org/whl/cu126 torch==2.12.0+cu126
+#
+# Confirm it took with:  python -c "import torch; print(torch.cuda.is_available())"
+# The pipeline needs no config to use it: sentence-transformers picks the GPU up
+# on its own, and every script prints which device the model landed on.
 pymilvus>=2.4
 sentence-transformers>=2.2
 pymupdf>=1.24       # PDF text extraction in extractpdf.py

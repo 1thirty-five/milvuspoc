@@ -1,0 +1,6 @@
+# These are bind-mounted straight into the Linux Milvus container by
+# docker-compose.yml, so they must keep LF endings no matter what a Windows
+# clone's core.autocrlf is set to.
+embedEtcd.yaml text eol=lf
+user.yaml      text eol=lf
+docker-compose.yml text eol=lf

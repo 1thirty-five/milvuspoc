@@ -25,12 +25,16 @@ Then edit input.md with the text to index, and run:
                                    # regenerate statistics.md (no terminal dump)
 """
 
+import hashlib
 import os
 import sys
 from pathlib import Path
 
 from pymilvus import MilvusClient, DataType
-from sentence_transformers import SentenceTransformer
+
+# sentence_transformers (and the torch it drags in) costs ~6s to import, so it is
+# imported inside get_model instead of here. Callers that only touch Milvus — a
+# cache probe, a query, a delete — then pay nothing for a model they never load.
 
 # Defaults — a UI can override any of these per call.
 DEFAULT_URI = "http://localhost:19530"
@@ -134,13 +138,28 @@ def get_model(name=DEFAULT_MODEL):
     `name` is a MODEL_PRESETS key (e.g. "bge-m3") or a literal HF model id. Any
     document prefix the preset requires is stashed on the returned model as
     `model.doc_prefix` so embed() can apply it transparently.
+
+    The weights are loaded straight from the local HF cache when they're already
+    there. Left to itself, SentenceTransformer round-trips to the Hugging Face
+    Hub to re-check file revisions on every single load, which costs ~20s and
+    buys nothing once a model is cached (bge-m3: 24s -> 2.4s). Only a genuine
+    cache miss is allowed to hit the network, so a first-ever run still downloads.
     """
+    from sentence_transformers import SentenceTransformer   # see note at imports
+
     hf_id, load_kwargs, doc_prefix = resolve_model(name)
     label = f"'{name}' ({hf_id})" if name != hf_id else f"'{hf_id}'"
     print(f"Loading embedding model {label}...")
-    model = SentenceTransformer(hf_id, **load_kwargs)
+    try:
+        model = SentenceTransformer(hf_id, local_files_only=True, **load_kwargs)
+    except Exception:
+        # Not in the cache (or only partly): fall back to a normal networked load,
+        # which downloads it. Every subsequent run then takes the fast path above.
+        print(f"  {hf_id} not in the local cache: downloading (first run only)...")
+        model = SentenceTransformer(hf_id, **load_kwargs)
     model.doc_prefix = doc_prefix
-    print(f"Model loaded. Embedding dimension = {get_dim(model)}")
+    model.hf_id = hf_id          # cache keys hash the resolved id, not the alias
+    print(f"Model loaded on {model.device}. Embedding dimension = {get_dim(model)}")
     return model
 
 
@@ -158,6 +177,33 @@ def connect(uri=DEFAULT_URI):
     return client
 
 
+def content_hash(model_name, text):
+    """Cache key for one chunk's embedding: a hash of (model, text).
+
+    The model name is part of the key because the same text embeds to a
+    different vector under a different model — switching models must miss the
+    cache rather than silently reuse vectors from the old one.
+    """
+    digest = hashlib.sha256()
+    digest.update(model_name.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(text.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def schema_is_current(client, collection, dim):
+    """True if an existing `collection` matches what this pipeline now expects.
+
+    Guards against reusing a collection built before `chunk_hash` existed, or one
+    whose vectors came from a model of a different dimension. Either way its rows
+    are unusable and it has to be rebuilt.
+    """
+    fields = {f["name"]: f for f in client.describe_collection(collection)["fields"]}
+    if "chunk_hash" not in fields:
+        return False
+    return fields["embedding"].get("params", {}).get("dim") == dim
+
+
 def ensure_collection(client, dim, collection=DEFAULT_COLLECTION, reset=False):
     """Make sure `collection` exists with the right schema and index.
 
@@ -167,16 +213,17 @@ def ensure_collection(client, dim, collection=DEFAULT_COLLECTION, reset=False):
         collection: collection name.
         reset: if True, drop and recreate for a clean slate.
     """
-    if reset and client.has_collection(collection):
+    if client.has_collection(collection):
+        if not reset and schema_is_current(client, collection, dim):
+            return collection
         client.drop_collection(collection)
 
-    if client.has_collection(collection):
-        return collection
-
-    # Schema: auto ID, the source text, and its vector.
+    # Schema: auto ID, the source text, its vector, and the cache key that ties
+    # the two together (see content_hash / fetch_cached).
     schema = client.create_schema(auto_id=True, enable_dynamic_field=True)
     schema.add_field("id", DataType.INT64, is_primary=True)
     schema.add_field("text", DataType.VARCHAR, max_length=2048)
+    schema.add_field("chunk_hash", DataType.VARCHAR, max_length=64)
     schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=dim)
 
     # HNSW: graph-based ANN index, low-latency high-recall lookups for an
@@ -214,6 +261,29 @@ def embed(model, texts):
     return model.encode(texts, normalize_embeddings=True)
 
 
+def fetch_cached(client, collection=DEFAULT_COLLECTION):
+    """Return {chunk_hash: row_id} for everything already in `collection`.
+
+    This is the embedding cache. A chunk whose hash is already here was embedded
+    on an earlier run, and its vector is sitting in Milvus — so it never has to
+    go through the model again. Embedding is by far the slowest stage, so this is
+    what makes re-ingesting a mostly-unchanged folder nearly free.
+    """
+    if not client.has_collection(collection):
+        return {}
+    fields = {f["name"] for f in client.describe_collection(collection)["fields"]}
+    if "chunk_hash" not in fields:
+        return {}      # collection predates the cache; ensure_collection rebuilds it
+    client.load_collection(collection)
+    rows = client.query(
+        collection_name=collection,
+        filter="id >= 0",
+        output_fields=["chunk_hash"],
+        limit=16384,
+    )
+    return {r["chunk_hash"]: r["id"] for r in rows}
+
+
 def store(client, model, documents, collection=DEFAULT_COLLECTION, embeddings=None):
     """Insert `documents` (and their vectors) into `collection`.
 
@@ -226,7 +296,8 @@ def store(client, model, documents, collection=DEFAULT_COLLECTION, embeddings=No
         embeddings = embed(model, documents)
 
     rows = [
-        {"text": doc, "embedding": emb.tolist()}
+        {"text": doc, "embedding": emb.tolist(),
+         "chunk_hash": content_hash(model.hf_id, doc)}
         for doc, emb in zip(documents, embeddings)
     ]
 
