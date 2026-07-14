@@ -24,23 +24,39 @@ import numpy as np
 import plotly.express as px
 import umap
 
-from loadmilvus import DEFAULT_COLLECTION, connect
+from loadmilvus import DEFAULT_COLLECTION, INSERT_BATCH, connect
 
 DEFAULT_OUT = "clusters.html"
 
 
 def fetch_labeled(client, collection=DEFAULT_COLLECTION):
-    """Return every row's text, embedding, and cluster label from `collection`."""
+    """Return every row's text, embedding, and cluster label from `collection`.
+
+    Paged, not a single capped query: a plain `query` tops out at 16384 rows, so
+    on a book-sized corpus it would quietly plot a fraction of the data and look
+    perfectly plausible doing it.
+    """
     if not client.has_collection(collection):
         raise SystemExit(
             f"Collection '{collection}' does not exist. Run loadmilvus.py first.")
     client.load_collection(collection)
-    rows = client.query(
+
+    iterator = client.query_iterator(
         collection_name=collection,
         filter="id >= 0",
         output_fields=["text", "embedding", "cluster"],
-        limit=16384,
+        batch_size=INSERT_BATCH,
     )
+    rows = []
+    try:
+        while True:
+            batch = iterator.next()
+            if not batch:
+                break
+            rows.extend(batch)
+    finally:
+        iterator.close()
+
     print(f"Fetched {len(rows)} rows from Milvus collection '{collection}'.")
     return rows
 
@@ -89,7 +105,14 @@ def build_plot(rows, coords, out=DEFAULT_OUT):
         labels={"color": "cluster", "x": "UMAP-1", "y": "UMAP-2"},
         title=f"Milvus document clusters ({len(rows)} docs, UMAP 2D projection)",
     )
-    fig.update_traces(marker=dict(size=10, line=dict(width=0.5, color="white")))
+    # Marker size scales down with the corpus: size 10 + a white outline reads
+    # well for the ~100 docs of input.md, but at tens of thousands of chunks the
+    # outlines merge into an opaque blob and the structure disappears. Small,
+    # semi-transparent points let dense regions show through as density instead.
+    if len(rows) > 5000:
+        fig.update_traces(marker=dict(size=3, opacity=0.5, line=dict(width=0)))
+    else:
+        fig.update_traces(marker=dict(size=10, line=dict(width=0.5, color="white")))
     fig.update_layout(legend_title_text="cluster")
 
     out_path = Path(out)

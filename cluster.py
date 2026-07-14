@@ -31,15 +31,22 @@ from pathlib import Path
 import numpy as np
 from sklearn.cluster import KMeans
 
-from loadmilvus import DEFAULT_COLLECTION, DEFAULT_RESULT, connect, ensure_collection
+from loadmilvus import (DEFAULT_COLLECTION, DEFAULT_RESULT, INSERT_BATCH, connect,
+                        ensure_collection, insert_batched)
 
 # Default cluster count. input.md holds 10 topical groups of ~10 docs each, so
 # k=10 is the natural choice; override per run with `--k <n>`.
 DEFAULT_K = 10
 
 
-def fetch_all(client, collection=DEFAULT_COLLECTION):
+def fetch_all(client, collection=DEFAULT_COLLECTION, batch_size=INSERT_BATCH):
     """Return every stored row (text + embedding) from `collection`.
+
+    Pages with query_iterator rather than a single query: a plain `query` is
+    capped (16384 by default, and Milvus refuses more), so on a corpus larger
+    than the cap it would silently return a truncated slice. store_labels
+    rebuilds the collection from whatever comes back, so a short read here
+    destroys every row it missed. Paging keeps that from happening.
 
     The collection must be loaded before it can be queried; `filter="id >= 0"`
     matches all auto-id rows. Returns the raw list of row dicts from Milvus.
@@ -48,12 +55,32 @@ def fetch_all(client, collection=DEFAULT_COLLECTION):
         raise SystemExit(
             f"Collection '{collection}' does not exist. Run loadmilvus.py first.")
     client.load_collection(collection)
-    rows = client.query(
+
+    iterator = client.query_iterator(
         collection_name=collection,
         filter="id >= 0",
-        output_fields=["text", "embedding"],
-        limit=16384,
+        # Every field, not just the ones KMeans needs: store_labels rebuilds the
+        # collection from these rows, so anything missing here is destroyed.
+        output_fields=["text", "embedding", "source", "chunk_hash"],
+        batch_size=batch_size,
     )
+    rows = []
+    try:
+        while True:
+            batch = iterator.next()
+            if not batch:
+                break
+            rows.extend(batch)
+    finally:
+        iterator.close()
+
+    expected = client.get_collection_stats(collection)["row_count"]
+    if len(rows) != expected:
+        raise SystemExit(
+            f"Read {len(rows)} rows but '{collection}' holds {expected}. "
+            f"Refusing to continue: store_labels rebuilds the collection from "
+            f"these rows, so clustering a partial read would destroy the rest.")
+
     print(f"Fetched {len(rows)} vectors from Milvus collection '{collection}'.")
     return rows
 
@@ -76,19 +103,32 @@ def cluster_vectors(embeddings, k=DEFAULT_K):
 def store_labels(client, rows, labels, collection=DEFAULT_COLLECTION):
     """Rebuild `collection` with each row's `cluster` label attached.
 
-    The collection is reset and every row re-inserted with its text, original
-    embedding, and a `cluster` field (absorbed by the dynamic field). Reusing
-    the stored embeddings means nothing is re-embedded. Returns the row count.
+    The collection is reset and every row re-inserted with a `cluster` field
+    (absorbed by the dynamic field). Reusing the stored embeddings means nothing
+    is re-embedded. Returns the row count.
+
+    Every field the row arrived with is carried back through the rebuild, not
+    just the ones clustering cares about: this drops and recreates the
+    collection, so any field left out here is silently destroyed for good.
+    `source` is what search results are attributed to, and `chunk_hash` is the
+    embedding cache's key -- losing it would force a full re-embed next ingest.
     """
     dim = len(rows[0]["embedding"])
     ensure_collection(client, dim=dim, collection=collection, reset=True)
-    data = [
-        {"text": row["text"], "embedding": row["embedding"], "cluster": int(label)}
-        for row, label in zip(rows, labels)
-    ]
-    result = client.insert(collection_name=collection, data=data)
-    client.flush(collection)
-    count = result["insert_count"]
+    data = []
+    for row, label in zip(rows, labels):
+        entry = {
+            "text": row["text"],
+            "embedding": row["embedding"],
+            "chunk_hash": row["chunk_hash"],
+            "cluster": int(label),
+        }
+        # `source` is dynamic and only set by the extractpdf path, so it may be
+        # absent on rows that came from loadmilvus. Don't insert a null for it.
+        if row.get("source") is not None:
+            entry["source"] = row["source"]
+        data.append(entry)
+    count = insert_batched(client, data, collection)   # also flushes
     print(f"Stored cluster labels for {count} rows in '{collection}'.")
     return count
 
@@ -140,8 +180,13 @@ def write_result_labels(rows, labels, path=DEFAULT_RESULT):
     print(f"Updated {path} with cluster labels for {len(entries)} entries{note}.")
 
 
-def print_clusters(rows, labels, k):
-    """Print each cluster id and the documents assigned to it."""
+def print_clusters(rows, labels, k, limit=10):
+    """Print each cluster id and the documents assigned to it.
+
+    Only the first `limit` members of each cluster are printed. On a book-sized
+    corpus the clusters run to thousands of chunks each, and printing them all
+    just dumps the whole corpus to the console.
+    """
     groups = {c: [] for c in range(k)}
     for row, label in zip(rows, labels):
         groups[int(label)].append(row["text"])
@@ -150,8 +195,10 @@ def print_clusters(rows, labels, k):
     for c in range(k):
         members = groups[c]
         print(f"\nCluster {c}  ({len(members)} docs)")
-        for text in members:
+        for text in members[:limit]:
             print(f"  - {text}")
+        if len(members) > limit:
+            print(f"  ... and {len(members) - limit} more")
 
 
 def parse_k_arg(argv, default=DEFAULT_K):

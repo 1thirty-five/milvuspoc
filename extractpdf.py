@@ -287,7 +287,7 @@ def store_records(records, model_name, reset=False):
     # Imported lazily so plain extraction/preview doesn't pull in pymilvus.
     from loadmilvus import (DEFAULT_COLLECTION, connect, content_hash, embed,
                             ensure_collection, fetch_cached, get_dim, get_model,
-                            resolve_model)
+                            insert_batched, resolve_model)
 
     # The cache key is the model's *id*, which resolve_model gives us without
     # loading any weights -- so the whole probe below (hash, look up, diff) runs
@@ -336,11 +336,10 @@ def store_records(records, model_name, reset=False):
          "source": r["source"], "chunk_hash": r["chunk_hash"]}
         for r, emb in zip(new_records, embeddings)
     ]
-    result = client.insert(collection_name=DEFAULT_COLLECTION, data=rows)
-    client.flush(DEFAULT_COLLECTION)
-    print(f"Inserted {result['insert_count']} new chunks "
+    count = insert_batched(client, rows, DEFAULT_COLLECTION)   # also flushes
+    print(f"Inserted {count} new chunks "
           f"from {len({r['source'] for r in records})} files.")
-    return result["insert_count"]
+    return count
 
 
 def main():

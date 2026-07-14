@@ -42,6 +42,12 @@ DEFAULT_COLLECTION = "documents"
 DEFAULT_INPUT = "input.md"
 DEFAULT_RESULT = "result.py"
 
+# Rows per insert / query page. Milvus caps a gRPC message at 64MB and a plain
+# `query` at 16384 rows; 1000 rows of bge-m3 (4KB of vector each) is ~5MB, well
+# clear of both. Everything that reads or writes the whole collection pages by
+# this, so corpus size stops being a correctness question.
+INSERT_BATCH = 1000
+
 # Named model presets — pick one per run with `--model <key>` (see main()).
 # Each entry needs an "id" (the Hugging Face model id); these optional keys let a
 # preset carry model-specific needs without touching the pipeline:
@@ -275,13 +281,48 @@ def fetch_cached(client, collection=DEFAULT_COLLECTION):
     if "chunk_hash" not in fields:
         return {}      # collection predates the cache; ensure_collection rebuilds it
     client.load_collection(collection)
-    rows = client.query(
+
+    # Paged, not a single capped query: a plain `query` tops out at 16384 rows,
+    # and a truncated cache reads as a cache *miss* -- the chunks past the cap
+    # would be re-embedded and inserted a second time, duplicating them in the
+    # collection. A book-sized corpus is well past that cap.
+    iterator = client.query_iterator(
         collection_name=collection,
         filter="id >= 0",
         output_fields=["chunk_hash"],
-        limit=16384,
+        batch_size=INSERT_BATCH,
     )
-    return {r["chunk_hash"]: r["id"] for r in rows}
+    cached = {}
+    try:
+        while True:
+            batch = iterator.next()
+            if not batch:
+                break
+            cached.update({r["chunk_hash"]: r["id"] for r in batch})
+    finally:
+        iterator.close()
+    return cached
+
+
+def insert_batched(client, rows, collection=DEFAULT_COLLECTION, batch=INSERT_BATCH):
+    """Insert `rows` in batches, returning the total inserted.
+
+    Milvus caps a single gRPC message at 64MB. One row is a vector (1024 floats
+    = 4KB at bge-m3) plus its text, so a few tens of thousands of rows in one
+    `insert` call blows the cap and the whole write fails with RESOURCE_EXHAUSTED.
+    Batching keeps every message comfortably under it, whatever the corpus size.
+    """
+    rows = list(rows)
+    total = 0
+    for i in range(0, len(rows), batch):
+        result = client.insert(collection_name=collection, data=rows[i:i + batch])
+        total += result["insert_count"]
+        if len(rows) > batch:
+            print(f"  inserted {total}/{len(rows)} rows...", end="\r", flush=True)
+    if len(rows) > batch:
+        print()
+    client.flush(collection)
+    return total
 
 
 def store(client, model, documents, collection=DEFAULT_COLLECTION, embeddings=None):
@@ -301,9 +342,7 @@ def store(client, model, documents, collection=DEFAULT_COLLECTION, embeddings=No
         for doc, emb in zip(documents, embeddings)
     ]
 
-    result = client.insert(collection_name=collection, data=rows)
-    client.flush(collection)   # make sure data is persisted
-    count = result["insert_count"]
+    count = insert_batched(client, rows, collection)   # also flushes
     print(f"Inserted {count} documents.")
     return count
 
