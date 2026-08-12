@@ -5,10 +5,10 @@ documents, embed them with a sentence-transformer, store the vectors, then
 **search**, **cluster**, and **visualize** them.
 
 ```
- PDFs (fileinput/)  ──extractpdf.py──┐
-                                     ├──> embed ──> Milvus `documents` ──┬──> search.py    (6 retrieval methods + rerank)
- text  (input.md)   ──loadmilvus.py──┘        (HNSW / COSINE)            ├──> cluster.py   (KMeans -> `cluster` label)
-                                                                         └──> visualize.py (UMAP -> clusters.html)
+ PDFs (fileinput/)  ──extractpdf.py──┐                                   ┌──> search.py        (6 retrieval methods + rerank)
+                                     ├──> embed ──> Milvus `documents` ──┼──> cluster.py       (KMeans -> `cluster` label)
+ text  (input.md)   ──loadmilvus.py──┘        (HNSW / COSINE)            ├──> customcluster.py (criteria.md -> named clusters)
+                                                                         └──> visualize.py     (UMAP -> clusters.html)
 ```
 
 Every stage is a small module of single-purpose functions returning plain dicts,
@@ -233,6 +233,127 @@ hovering to show the document text.
 > `search.py` will print `source=None`. Re-run `extractpdf.py --store` to get
 > provenance back (which in turn clears the `cluster` labels).
 
+## Clustering on your own criterion
+
+`cluster.py` is criterion-free — KMeans groups by whatever the embedding model
+thinks dominates, and the only knob is `k`. `customcluster.py` lets you say
+*what to cluster on*, in words, in `criteria.md`:
+
+```bash
+python customcluster.py                     # read criteria.md
+python customcluster.py --criteria mine.md  # a different criterion file
+python customcluster.py --dry-run           # print the groups, write nothing
+```
+
+It works because **a criterion stated in words embeds into the same space as the
+documents** — so it becomes geometry, with no training and no LLM.
+
+### The file
+
+```markdown
+# Mode
+anchor
+
+# Labels
+- pricing: fees, discounts, billing terms
+- legal risk: liability, indemnity, compliance exposure
+
+# Settings
+assign = seeded
+floor  = auto
+model  = bge-m3
+```
+
+Comment it with `<!-- -->` only. The parser treats a leading `#` as a section
+heading, so a `#` comment inside `# Settings` silently discards every setting
+below it.
+
+### Labels: the description is what does the work
+
+Each label is embedded as *name plus description*, and the description carries
+almost all of the signal. `Tier 1` embeds to noise; `Tier 1: capital adequacy
+requirements under Basel III` embeds to something a corpus can actually match.
+Write it the way you would explain the bucket to a colleague. A bare name works
+and matches far worse.
+
+Two labels in the shipped `criteria.md` exist to **absorb** text rather than to
+be read. `front matter` catches table-of-contents dot leaders, the translation
+disclaimer and the IR contact page; navigation furniture carries no subject
+matter, so without a bucket of its own it spreads evenly across the real ones
+and quietly dirties every cluster. `financial statements` does the same job for
+the balance-sheet and note tables. Give the junk a home and the prose buckets
+stay clean.
+
+Splitting matters too. `history and group structure` is separate from strategy
+because the 1947-onward founding narrative is about the company's past, not its
+plans — merged, it made `business and strategy` the largest bucket in the report
+by absorbing seventy years of karuta manufacturing.
+
+### Settings
+
+| key | default | what it does |
+|---|---|---|
+| `assign` | `seeded` | `seeded` uses your labels as KMeans init, so clusters settle onto real density while keeping your names. `hard` takes the nearest label and stops — fully predictable, and what you want if the buckets must mean exactly what you wrote. |
+| `floor` | `auto` | Cutoff below which an assignment is called uncorrelated and sent to `unassigned` (cluster `-1`). `auto` = two sigma below this run's own mean. `0` leaves the bucket empty — it is still always reported. |
+| `model` | `bge-m3` | **Must** be the model that embedded the corpus, or the labels land in a different space and the assignment is garbage. |
+| `scheme` | `default` | A name for this clustering, stored per row as `cluster_scheme` so you can tell runs apart. |
+| `preview` | `10` | Member chunks printed per cluster. |
+
+**Don't set `floor` to an absolute cosine without measuring.** Modern embedding
+models compress cosine into a narrow high band: on this corpus bge-m3 puts
+*every* chunk between 0.64 and 0.88 of its centroid, so a floor of 0.45 — which
+sounds permissive — catches exactly nothing. `auto` reads the cutoff off the run
+itself and means the same thing on any model or corpus.
+
+### Why `seeded` is the default
+
+Measured, not assumed. The intuition says `hard` — buckets that mean exactly
+what you wrote — but nearest-anchor performs badly on a single-document corpus:
+every chunk sits at 0.55–0.63 cosine to *every* label, because the shared
+"Nintendo annual securities report" component dominates each vector and the
+discriminating margin is only what is left over. At that margin, incidental word
+overlap decides the assignment.
+
+Contiguity in document order makes it concrete. Chunks are stored in reading
+order, so a clustering that has really found the sections should produce long
+unbroken runs of one label:
+
+| | `hard` | `seeded` |
+|---|---|---|
+| isolated flips | 16% | **8%** |
+| corporate governance | span 7–397 (density 0.21) | **span 237–397 (0.55)** |
+| employees | span 21–462 (density 0.05) | **span 398–462 (0.23)** |
+
+Under `hard`, `corporate governance` was smeared across the whole document.
+Under `seeded` it is the contiguous block it is in the printed report. The
+centroids do drift off the literal labels — but they drift *onto the document's
+own section boundaries*, which is what was wanted.
+
+### What anchor mode cannot do
+
+It suits **topical** criteria: which regulatory regime, which product area. A
+criterion that cuts *across* topic — "how formal is this", "how urgent" —
+nearest-label assignment cannot express. In raw embedding space topic dominates,
+so such a criterion sends every chunk to whichever label shares its subject
+matter and returns something plausible and wrong. An `axes` mode that handled
+those (projecting onto `normalize(embed(left) - embed(right))`) was removed on
+2026-08-12.
+
+### Output
+
+Labels are stored three ways per row — `cluster` (int, same as before),
+`cluster_name`, and `cluster_scheme` — so `search.py` and `visualize.py` keep
+working untouched:
+
+```python
+client.query(collection_name="documents", filter='cluster_name == "pricing"',
+             output_fields=["text", "cluster_name"])
+```
+
+> **Gotcha:** same rebuild as `cluster.py`, so only one clustering lives in
+> Milvus at a time and each run replaces the last. `cluster_scheme` tells you
+> which one is currently stored.
+
 ## Choosing a model
 
 One model is used for a whole run. List the presets with `--list-models`:
@@ -285,7 +406,9 @@ is not measured.
 | `text` | `VARCHAR(2048)` | The document or chunk. |
 | `embedding` | `FLOAT_VECTOR(dim)` | L2-normalized. `dim` follows the model. |
 | `source` | dynamic | Filename, set by `extractpdf.py`. |
-| `cluster` | dynamic | KMeans label, set by `cluster.py`. |
+| `cluster` | dynamic | KMeans label, set by `cluster.py` / `customcluster.py`. |
+| `cluster_name` | dynamic | Human name for the cluster, set by `customcluster.py`. |
+| `cluster_scheme` | dynamic | Which criterion produced the labels, set by `customcluster.py`. |
 
 Indexed with **HNSW** (`M=16`, `efConstruction=200`) on **COSINE**, matching the
 normalized embeddings — so scores are cosine similarity and `ef` tunes recall at
@@ -299,6 +422,8 @@ query time.
 | `extractpdf.py` | Extract + chunk documents from `fileinput/` with PyMuPDF, store them with a `source` field. |
 | `search.py` | Retrieval front-end: dense / lexical / tfidf / hybrid / weighted / mmr, plus cross-encoder reranking. |
 | `cluster.py` | KMeans over the stored vectors; writes a `cluster` label back into Milvus. |
+| `customcluster.py` | Clustering on a user-defined criterion read from `criteria.md`. |
+| `criteria.md` | What to cluster on: mode, labels, settings. Documented in this README. |
 | `visualize.py` | UMAP projection of the vectors to an interactive Plotly scatter. |
 | `benchmark.py` | Measure the storing pipeline → `statistics.md`. |
 | `input.md` | Documents to index (bullets under `# Documents`). |

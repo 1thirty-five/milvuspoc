@@ -38,6 +38,63 @@ from loadmilvus import (DEFAULT_COLLECTION, DEFAULT_RESULT, INSERT_BATCH, connec
 # k=10 is the natural choice; override per run with `--k <n>`.
 DEFAULT_K = 10
 
+# The catch-all bucket. Every clustering run emits it, whether or not anything
+# lands in it, so downstream consumers can rely on it existing rather than
+# discovering it the first time a corpus happens to produce outliers.
+# -1 follows the DBSCAN/HDBSCAN convention for noise, and sorts naturally to the
+# end; `cluster` stays an int, so existing filters and plots keep working.
+UNASSIGNED = -1
+UNASSIGNED_NAME = "unassigned"
+
+# How far below the mean a row's similarity to its own centroid must fall before
+# it is called uncorrelated, in standard deviations.
+#
+# This is relative, not an absolute cosine cutoff, and that is deliberate:
+# measured on this corpus, bge-m3 puts *every* row between 0.643 and 0.876 of its
+# centroid (mean 0.794, sd 0.055). An absolute floor of 0.45 -- which sounds
+# permissive -- catches exactly zero rows. Modern embedding models compress
+# cosine into a narrow high band, so a fixed threshold is either inert or
+# catastrophic depending on the model, whereas "two sigma below this run's mean"
+# means the same thing on any model and any corpus.
+DEFAULT_FLOOR_SIGMA = 2.0
+
+
+def unassigned_floor(similarity, sigma=DEFAULT_FLOOR_SIGMA):
+    """Return the similarity below which a row counts as uncorrelated."""
+    values = np.asarray(similarity, dtype="float64")
+    if values.size == 0:
+        return float("-inf")
+    return float(values.mean() - sigma * values.std())
+
+
+def apply_floor(labels, similarity, floor):
+    """Send rows below `floor` to UNASSIGNED. Returns (labels, count moved)."""
+    labels = np.asarray(labels).copy()
+    if floor is None or not np.isfinite(floor):
+        return labels, 0
+    labels[np.asarray(similarity) < floor] = UNASSIGNED
+    return labels, int((labels == UNASSIGNED).sum())
+
+
+def centroid_similarity(embeddings, labels, k):
+    """Cosine of every row to the centroid of the cluster it was assigned.
+
+    Embeddings are L2-normalized on ingest, so a dot product is cosine. The
+    centroid of a set of unit vectors is not itself unit length, hence the
+    explicit renormalization.
+    """
+    matrix = np.asarray(embeddings, dtype="float32")
+    similarity = np.zeros(len(matrix), dtype="float32")
+    for c in range(k):
+        members = labels == c
+        if not members.any():
+            continue
+        centroid = matrix[members].mean(axis=0)
+        norm = np.linalg.norm(centroid)
+        centroid = centroid / (norm if norm else 1.0)
+        similarity[members] = matrix[members] @ centroid
+    return similarity
+
 
 def fetch_all(client, collection=DEFAULT_COLLECTION, batch_size=INSERT_BATCH):
     """Return every stored row (text + embedding) from `collection`.
@@ -61,7 +118,7 @@ def fetch_all(client, collection=DEFAULT_COLLECTION, batch_size=INSERT_BATCH):
         filter="id >= 0",
         # Every field, not just the ones KMeans needs: store_labels rebuilds the
         # collection from these rows, so anything missing here is destroyed.
-        output_fields=["text", "embedding", "source", "chunk_hash"],
+        output_fields=["text", "embedding", "source", "chunk_hash", "seq"],
         batch_size=batch_size,
     )
     rows = []
@@ -85,11 +142,15 @@ def fetch_all(client, collection=DEFAULT_COLLECTION, batch_size=INSERT_BATCH):
     return rows
 
 
-def cluster_vectors(embeddings, k=DEFAULT_K):
+def cluster_vectors(embeddings, k=DEFAULT_K, sigma=DEFAULT_FLOOR_SIGMA):
     """Run KMeans over `embeddings` and return an integer label per vector.
 
     Vectors are L2-normalized (COSINE space), so Euclidean KMeans approximates
     cosine clustering well. n_init/random_state are fixed for reproducible runs.
+
+    Rows that fit their assigned centroid poorly are moved to UNASSIGNED rather
+    than left inside a cluster they only nominally belong to. Pass `sigma=0` to
+    disable that and keep plain KMeans behaviour.
     """
     matrix = np.asarray(embeddings, dtype="float32")
     n = len(matrix)
@@ -97,10 +158,28 @@ def cluster_vectors(embeddings, k=DEFAULT_K):
         raise SystemExit(f"Cannot make {k} clusters from {n} vectors (k > n).")
     print(f"Clustering {n} vectors into k={k} groups with KMeans...")
     km = KMeans(n_clusters=k, n_init=10, random_state=42)
-    return km.fit_predict(matrix)
+    labels = km.fit_predict(matrix)
+
+    # KMeans assigns every point to something -- it has no concept of "this one
+    # belongs nowhere". So the outliers are found afterwards, by how well each
+    # row actually fits the centroid it was handed, and moved to UNASSIGNED.
+    if sigma <= 0:
+        # Not "a floor at the mean" -- that would exile every below-average row,
+        # roughly half the corpus. sigma<=0 means the check is off.
+        print(f"  outlier floor disabled (sigma={sigma}); "
+              f"{UNASSIGNED_NAME} left empty.")
+        return labels
+
+    similarity = centroid_similarity(matrix, labels, k)
+    floor = unassigned_floor(similarity, sigma)
+    labels, dropped = apply_floor(labels, similarity, floor)
+    print(f"  floor={floor:.3f} (mean-{sigma}sd of centroid similarity): "
+          f"{dropped} row(s) -> {UNASSIGNED_NAME}.")
+    return labels
 
 
-def store_labels(client, rows, labels, collection=DEFAULT_COLLECTION):
+def store_labels(client, rows, labels, collection=DEFAULT_COLLECTION,
+                 names=None, scheme=None):
     """Rebuild `collection` with each row's `cluster` label attached.
 
     The collection is reset and every row re-inserted with a `cluster` field
@@ -112,21 +191,35 @@ def store_labels(client, rows, labels, collection=DEFAULT_COLLECTION):
     collection, so any field left out here is silently destroyed for good.
     `source` is what search results are attributed to, and `chunk_hash` is the
     embedding cache's key -- losing it would force a full re-embed next ingest.
+
+    `names` and `scheme` are what customcluster.py adds on top: a per-row human
+    name for the cluster (`cluster_name`) and the criterion that produced it
+    (`cluster_scheme`). `cluster` stays an int either way, so everything that
+    already filters or plots on it -- search.py, visualize.py -- keeps working.
     """
     dim = len(rows[0]["embedding"])
     ensure_collection(client, dim=dim, collection=collection, reset=True)
     data = []
-    for row, label in zip(rows, labels):
+    for i, (row, label) in enumerate(zip(rows, labels)):
         entry = {
             "text": row["text"],
             "embedding": row["embedding"],
             "chunk_hash": row["chunk_hash"],
             "cluster": int(label),
         }
-        # `source` is dynamic and only set by the extractpdf path, so it may be
-        # absent on rows that came from loadmilvus. Don't insert a null for it.
+        if names is not None:
+            entry["cluster_name"] = str(names[i])
+        if scheme is not None:
+            entry["cluster_scheme"] = str(scheme)
+        # `source` and `seq` are dynamic and only set by the extractpdf path, so
+        # they may be absent on rows that came from loadmilvus. Don't insert
+        # nulls for them. `seq` is the chunk's position in its file, and it is
+        # what visualize.py sorts on -- dropping it here would silently return
+        # the plot to arbitrary segment order on the next clustering run.
         if row.get("source") is not None:
             entry["source"] = row["source"]
+        if row.get("seq") is not None:
+            entry["seq"] = row["seq"]
         data.append(entry)
     count = insert_batched(client, data, collection)   # also flushes
     print(f"Stored cluster labels for {count} rows in '{collection}'.")
@@ -187,14 +280,21 @@ def print_clusters(rows, labels, k, limit=10):
     corpus the clusters run to thousands of chunks each, and printing them all
     just dumps the whole corpus to the console.
     """
+    # UNASSIGNED is seeded here, not discovered from the data, so the bucket is
+    # reported on every run even when empty. An absent category reads as "no
+    # outlier detection happened"; an empty one states positively that the check
+    # ran and everything cleared it.
     groups = {c: [] for c in range(k)}
+    groups[UNASSIGNED] = []
     for row, label in zip(rows, labels):
-        groups[int(label)].append(row["text"])
+        groups.setdefault(int(label), []).append(row["text"])
 
     print(f"\nClusters (k={k}):")
-    for c in range(k):
+    for c in list(range(k)) + [UNASSIGNED]:
         members = groups[c]
-        print(f"\nCluster {c}  ({len(members)} docs)")
+        title = (f"Cluster {UNASSIGNED} ({UNASSIGNED_NAME})"
+                 if c == UNASSIGNED else f"Cluster {c}")
+        print(f"\n{title}  ({len(members)} docs)")
         for text in members[:limit]:
             print(f"  - {text}")
         if len(members) > limit:

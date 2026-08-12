@@ -41,10 +41,14 @@ def fetch_labeled(client, collection=DEFAULT_COLLECTION):
             f"Collection '{collection}' does not exist. Run loadmilvus.py first.")
     client.load_collection(collection)
 
+    # `cluster_name` is only present when the rows were labeled by
+    # customcluster.py. Dynamic fields that don't exist come back absent rather
+    # than erroring, so asking for it costs nothing on a plain cluster.py run.
     iterator = client.query_iterator(
         collection_name=collection,
         filter="id >= 0",
-        output_fields=["text", "embedding", "cluster"],
+        output_fields=["text", "embedding", "cluster", "cluster_name",
+                       "cluster_scheme", "source", "seq"],
         batch_size=INSERT_BATCH,
     )
     rows = []
@@ -57,7 +61,26 @@ def fetch_labeled(client, collection=DEFAULT_COLLECTION):
     finally:
         iterator.close()
 
+    # Milvus returns rows in segment order, which is neither insertion order nor
+    # document order -- and the incremental store makes auto-ids useless as a
+    # proxy, since cached rows keep old ids while re-embedded ones get new ones.
+    # `seq` (written by extractpdf.extract_records) is the chunk's position in
+    # its file, so sorting on (source, seq) puts the corpus back in reading
+    # order. Rows stored before `seq` existed sort as -1, i.e. first and among
+    # themselves arbitrarily; re-ingest with --reset to give them real values.
+    rows.sort(key=lambda r: (str(r.get("source", "")), int(r.get("seq", -1))))
+
     print(f"Fetched {len(rows)} rows from Milvus collection '{collection}'.")
+    # Warn on *any* unordered row, not just an entirely unordered collection.
+    # A partial state is the likely one and the more misleading: the incremental
+    # store reuses cached rows untouched, so a plain --store after this field was
+    # added leaves every cache hit without a `seq` while new chunks get one, and
+    # the plot then looks mostly ordered with a block of stragglers at the front.
+    unordered = sum(1 for r in rows if int(r.get("seq", -1)) < 0)
+    if unordered:
+        print(f"  ! {unordered}/{len(rows)} rows have no `seq` and will sort "
+              f"arbitrarily. They predate ordered ingestion; the cache keeps "
+              f"them as-is, so re-run: extractpdf.py --store --reset")
     return rows
 
 
@@ -93,17 +116,46 @@ def wrap(text, width=60):
     return "<br>".join(out)
 
 
+def legend_labels(rows):
+    """One legend entry per row, and the order they should appear in.
+
+    Rows labeled by customcluster.py carry a `cluster_name` -- "pricing", or
+    "technical detail + casual explanation" -- which is far more use in a legend
+    than an integer. Plain cluster.py rows have only the int, so fall back to
+    that. Either way the entries are ordered by the underlying cluster id, with
+    `unassigned` (-1) last rather than first, since it's a leftovers bucket.
+    """
+    named = any(row.get("cluster_name") for row in rows)
+    ids = [int(row.get("cluster", -1)) for row in rows]
+    if named:
+        labels = [f"{i}. {row.get('cluster_name') or 'unassigned'}"
+                  for i, row in zip(ids, rows)]
+    else:
+        labels = [str(i) for i in ids]
+
+    # Sort the legend by cluster id, not alphabetically: "10" must not sit
+    # between "1" and "2", and the names carry no useful sort order at all.
+    order_by_id = {}
+    for cluster_id, label in zip(ids, labels):
+        order_by_id.setdefault(label, cluster_id)
+    order = sorted(order_by_id, key=lambda l: (order_by_id[l] < 0, order_by_id[l]))
+    return labels, order, named
+
+
 def build_plot(rows, coords, out=DEFAULT_OUT):
     """Write an interactive Plotly scatter of the 2D points, colored by cluster."""
-    clusters = [str(row.get("cluster")) for row in rows]  # str -> discrete colors
+    clusters, order, named = legend_labels(rows)   # str -> discrete colors
+    scheme = rows[0].get("cluster_scheme") if named else None
+    subtitle = f", criterion '{scheme}'" if scheme else ""
     fig = px.scatter(
         x=coords[:, 0],
         y=coords[:, 1],
         color=clusters,
         hover_name=[wrap(row["text"]) for row in rows],
-        category_orders={"color": sorted(set(clusters), key=lambda c: int(c))},
+        category_orders={"color": order},
         labels={"color": "cluster", "x": "UMAP-1", "y": "UMAP-2"},
-        title=f"Milvus document clusters ({len(rows)} docs, UMAP 2D projection)",
+        title=(f"Milvus document clusters ({len(rows)} docs{subtitle}, "
+               f"UMAP 2D projection)"),
     )
     # Marker size scales down with the corpus: size 10 + a white outline reads
     # well for the ~100 docs of input.md, but at tens of thousands of chunks the

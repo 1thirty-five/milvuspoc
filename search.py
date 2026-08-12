@@ -44,6 +44,7 @@ Run (PowerShell):
 
 import re
 import sys
+import textwrap
 
 from loadmilvus import (
     DEFAULT_COLLECTION,
@@ -100,7 +101,7 @@ def dense_search(client, model, query, limit, ef, collection=DEFAULT_COLLECTION,
     """
     client.load_collection(collection)
     query_vec = embed(model, [query])[0].tolist()
-    fields = ["text", "source"] + (["embedding"] if with_vectors else [])
+    fields = ["text", "source", "seq"] + (["embedding"] if with_vectors else [])
     hits = client.search(
         collection_name=collection,
         data=[query_vec],
@@ -115,6 +116,7 @@ def dense_search(client, model, query, limit, ef, collection=DEFAULT_COLLECTION,
             "id": h["id"],
             "text": h["entity"].get("text", ""),
             "source": h["entity"].get("source"),
+            "seq": h["entity"].get("seq"),
             "score": h["distance"],
         }
         if with_vectors:
@@ -133,10 +135,11 @@ def fetch_corpus(client, collection=DEFAULT_COLLECTION):
     rows = client.query(
         collection_name=collection,
         filter="id >= 0",
-        output_fields=["text", "source"],
+        output_fields=["text", "source", "seq"],
         limit=16384,
     )
-    return [{"id": r["id"], "text": r["text"], "source": r.get("source")} for r in rows]
+    return [{"id": r["id"], "text": r["text"], "source": r.get("source"),
+             "seq": r.get("seq")} for r in rows]
 
 
 def tokenize(text):
@@ -335,15 +338,34 @@ def search(client, query, method, model_name, k, candidates, ef,
     return results
 
 
-def print_results(query, records, method, reranked, preview=200):
-    """Print the ranked results with score, source, and a text preview."""
+def print_results(query, records, method, reranked, preview=None, width=96):
+    """Print the ranked results with score, source, and the full chunk text.
+
+    The whole chunk is printed, not a head of it. A truncated result tells you
+    something matched but not whether it actually answers the question -- and
+    since a chunk is exactly what was embedded, seeing all of it is the only way
+    to judge whether retrieval or chunking is at fault when a hit looks wrong.
+    Text is wrapped rather than emitted as one long line so a 800-character
+    table row stays readable in a terminal.
+
+    Pass `preview=N` (CLI: --preview N) to go back to a truncated head when
+    scanning many results at once.
+    """
     label = f"{method}" + (" + rerank" if reranked else "")
-    print(f"\nTop {len(records)} for {query!r}  (method: {label})\n" + "-" * 60)
+    print(f"\nTop {len(records)} for {query!r}  (method: {label})\n" + "-" * width)
     for rank, rec in enumerate(records, start=1):
-        head = " ".join(rec["text"].split())[:preview]
-        ellipsis = "..." if len(rec["text"]) > preview else ""
-        print(f"\n[{rank}] score={rec['score']:.4f}  source={rec.get('source')}")
-        print(f"    {head}{ellipsis}")
+        text = " ".join(rec["text"].split())
+        truncated = preview is not None and len(text) > preview
+        if preview is not None:
+            text = text[:preview]
+
+        seq = rec.get("seq")
+        where = f"  source={rec.get('source')}" + (
+            f"  chunk #{seq}" if seq is not None and int(seq) >= 0 else "")
+        print(f"\n[{rank}] score={rec['score']:.4f}{where}  ({len(rec['text'])} chars)")
+        for line in textwrap.wrap(text + ("..." if truncated else ""),
+                                  width=width - 4) or [""]:
+            print(f"    {line}")
 
 
 def parse_flag_value(argv, flag, default=None):
@@ -390,7 +412,7 @@ def main():
             'Usage: search.py "your query" '
             '[--method dense|lexical|tfidf|hybrid|weighted|mmr] [--model <key>] '
             '[--rerank] [--rerank-model <id>] [--k N] [--candidates N] '
-            '[--alpha F] [--lambda F]')
+            '[--alpha F] [--lambda F] [--preview N]')
 
     method = parse_flag_value(sys.argv, "--method", "hybrid")
     model_name = parse_model_arg(sys.argv)          # --model / MILVUS_MODEL / default
@@ -402,6 +424,9 @@ def main():
     ef = int(parse_flag_value(sys.argv, "--ef", max(64, candidates)))
     alpha = float(parse_flag_value(sys.argv, "--alpha", DEFAULT_ALPHA))       # weighted
     lambda_mult = float(parse_flag_value(sys.argv, "--lambda", DEFAULT_LAMBDA))  # mmr
+    # Full text by default; --preview N truncates when scanning many results.
+    preview_arg = parse_flag_value(sys.argv, "--preview")
+    preview = int(preview_arg) if preview_arg is not None else None
 
     client = connect()
     if not client.has_collection(DEFAULT_COLLECTION):
@@ -411,7 +436,7 @@ def main():
 
     results = search(client, query, method, model_name, k, candidates, ef,
                      do_rerank, rerank_model, alpha, lambda_mult)
-    print_results(query, results, method, do_rerank)
+    print_results(query, results, method, do_rerank, preview=preview)
 
 
 if __name__ == "__main__":
