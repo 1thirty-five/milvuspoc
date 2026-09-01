@@ -20,6 +20,15 @@ Six techniques, selectable with `--method`, plus an optional reranker on top:
               that are relevant to the query but DIVERSE from each other, so the
               top-k aren't near-duplicates. Balance with `--lambda` (1.0 = pure
               relevance, 0 = pure diversity).
+    hierarchical
+              two-stage: rank the CLUSTERS against the query, then take a
+              decreasing quota from each -- 5 chunks from the best cluster, 4
+              from the 2nd, 3 from the 3rd, 2 from the 4th, 1 from the 5th
+              (`--allocation`). Guarantees the answer set spans the five most
+              relevant regions of the corpus instead of collapsing onto one.
+              Requires cluster labels (cluster.py / customcluster.py); lives in
+              hierarchicalsearch.py, which also has its own CLI and prints the
+              cluster leaderboard.
 
     --rerank  re-score the retrieved candidates with a cross-encoder that reads
               the query and each chunk TOGETHER (joint attention), then keep the
@@ -39,6 +48,7 @@ Run (PowerShell):
     .venv\\Scripts\\python.exe search.py "scaled dot-product" --method hybrid --rerank
     .venv\\Scripts\\python.exe search.py "attention" --method weighted --alpha 0.7
     .venv\\Scripts\\python.exe search.py "attention" --method mmr --lambda 0.5 --k 5
+    .venv\\Scripts\\python.exe search.py "risk" --method hierarchical --allocation 5,4,3,2,1
     .venv\\Scripts\\python.exe search.py "BLEU score" --method dense --model minilm --k 3
 """
 
@@ -147,12 +157,24 @@ def tokenize(text):
     return re.findall(r"[a-z0-9]+", text.lower())
 
 
+# Built BM25 indexes, keyed by the row ids they were built over. Constructing a
+# BM25Okapi tokenizes every chunk and recomputes the corpus term statistics, and
+# none of that depends on the query — but a CLI run does it once and a UI issuing
+# many queries against one collection would otherwise do it every time. Keying on
+# the ids means a changed corpus builds its own index rather than reusing a stale
+# one, so this stays correct across a re-ingest without an explicit invalidation.
+_BM25_CACHE = {}
+
+
 def lexical_search(corpus, query, limit):
     """BM25 keyword ranking over `corpus`, returning the top `limit` records.
 
     Scores by term frequency x inverse document frequency with length
     normalization — rewards rare query terms appearing in short chunks. `score`
     is the raw BM25 score (unbounded; comparable only within this result set).
+
+    The index itself is cached per corpus (see _BM25_CACHE); only the query
+    scoring is per-call.
     """
     try:
         from rank_bm25 import BM25Okapi
@@ -161,7 +183,11 @@ def lexical_search(corpus, query, limit):
             "Lexical/hybrid search needs rank-bm25. Install it:\n"
             "    .venv\\Scripts\\python.exe -m pip install rank-bm25")
 
-    bm25 = BM25Okapi([tokenize(row["text"]) for row in corpus])
+    key = tuple(row["id"] for row in corpus)
+    bm25 = _BM25_CACHE.get(key)
+    if bm25 is None:
+        bm25 = BM25Okapi([tokenize(row["text"]) for row in corpus])
+        _BM25_CACHE[key] = bm25
     scores = bm25.get_scores(tokenize(query))
     ranked = sorted(zip(corpus, scores), key=lambda pair: pair[1], reverse=True)
     return [{**row, "score": float(score)} for row, score in ranked[:limit]]
@@ -290,25 +316,33 @@ def rerank(query, records, model_id, limit):
 
 
 def search(client, query, method, model_name, k, candidates, ef,
-           do_rerank, rerank_model, alpha=DEFAULT_ALPHA, lambda_mult=DEFAULT_LAMBDA):
+           do_rerank, rerank_model, alpha=DEFAULT_ALPHA, lambda_mult=DEFAULT_LAMBDA,
+           allocation=None, model=None):
     """Run one retrieval technique (+ optional rerank) and return top-k records.
 
     Dispatches on `method`; only loads an embedding model for the techniques
     that need one (lexical/tfidf are model-free). When reranking, the base method
     retrieves `candidates` first so the reranker has a shortlist to reorder.
+
+    Pass `model` to reuse a model you already hold. Without it this calls
+    get_model per search, which re-reads the weights from the local HF cache
+    every time -- ~10s for bge-m3. That is invisible to a CLI run, which searches
+    once and exits, and crippling to any caller that searches repeatedly in one
+    process (a UI, a sweep, an eval loop). `model_name` is still required: it
+    names the model in the dimension-mismatch error.
     """
     depth = candidates if do_rerank else k
 
     def _embedder():
-        """Load the query model, validating its dim against the stored vectors."""
+        """Return the query model, validating its dim against the stored vectors."""
         stored = get_stored_dim(client)
-        model = get_model(model_name)
-        if get_dim(model) != stored:
+        loaded = model if model is not None else get_model(model_name)
+        if get_dim(loaded) != stored:
             raise SystemExit(
-                f"Model '{model_name}' is {get_dim(model)}-dim but the stored "
+                f"Model '{model_name}' is {get_dim(loaded)}-dim but the stored "
                 f"vectors are {stored}-dim. Query with the model they were built "
                 f"with, or re-ingest with --model {model_name}.")
-        return model
+        return loaded
 
     if method == "dense":
         results = dense_search(client, _embedder(), query, depth, ef)
@@ -328,10 +362,20 @@ def search(client, query, method, model_name, k, candidates, ef,
         # MMR needs a pool larger than the output to have room to diversify.
         results = mmr_search(client, _embedder(), query, depth, candidates, ef,
                              lambda_mult)
+    elif method == "hierarchical":
+        # Imported lazily: hierarchicalsearch borrows rerank() from this module
+        # for its own CLI, so a top-level import here would be circular.
+        from hierarchicalsearch import DEFAULT_ALLOCATION, hierarchical_search
+        # The allocation, not `depth`, decides how many results come back --
+        # truncating the funnel to k would discard the quotas that are the whole
+        # point. `--k` still trims the reranked shortlist below.
+        results, _, _, _ = hierarchical_search(
+            client, _embedder(), query, allocation or DEFAULT_ALLOCATION, ef)
+        results = results[:k] if not do_rerank else results
     else:
         raise SystemExit(
-            f"Unknown --method {method!r} "
-            f"(use dense, lexical, tfidf, hybrid, weighted, or mmr).")
+            f"Unknown --method {method!r} (use dense, lexical, tfidf, hybrid, "
+            f"weighted, mmr, or hierarchical).")
 
     if do_rerank:
         results = rerank(query, results, rerank_model, k)
@@ -362,7 +406,12 @@ def print_results(query, records, method, reranked, preview=None, width=96):
         seq = rec.get("seq")
         where = f"  source={rec.get('source')}" + (
             f"  chunk #{seq}" if seq is not None and int(seq) >= 0 else "")
-        print(f"\n[{rank}] score={rec['score']:.4f}{where}  ({len(rec['text'])} chars)")
+        # Only hierarchical search tags results with the cluster they came from;
+        # without it you can't tell which region of the corpus a hit represents.
+        origin = (f"  cluster #{rec['cluster_rank']} [{rec.get('cluster')}] "
+                  f"{rec.get('cluster_name')}") if "cluster_rank" in rec else ""
+        print(f"\n[{rank}] score={rec['score']:.4f}{origin}{where}"
+              f"  ({len(rec['text'])} chars)")
         for line in textwrap.wrap(text + ("..." if truncated else ""),
                                   width=width - 4) or [""]:
             print(f"    {line}")
@@ -381,7 +430,8 @@ def parse_flag_value(argv, flag, default=None):
 def parse_query(argv):
     """Return the first positional (non-flag) argument as the search query."""
     flags_with_values = {"--method", "--model", "--rerank-model", "--k",
-                         "--candidates", "--ef", "--alpha", "--lambda"}
+                         "--candidates", "--ef", "--alpha", "--lambda",
+                         "--allocation", "--preview"}
     skip = False
     for arg in argv[1:]:
         if skip:
@@ -410,13 +460,24 @@ def main():
     if not query:
         raise SystemExit(
             'Usage: search.py "your query" '
-            '[--method dense|lexical|tfidf|hybrid|weighted|mmr] [--model <key>] '
-            '[--rerank] [--rerank-model <id>] [--k N] [--candidates N] '
-            '[--alpha F] [--lambda F] [--preview N]')
+            '[--method dense|lexical|tfidf|hybrid|weighted|mmr|hierarchical] '
+            '[--model <key>] [--rerank] [--rerank-model <id>] [--k N] '
+            '[--candidates N] [--alpha F] [--lambda F] [--allocation 5,4,3,2,1] '
+            '[--preview N]')
 
     method = parse_flag_value(sys.argv, "--method", "hybrid")
     model_name = parse_model_arg(sys.argv)          # --model / MILVUS_MODEL / default
-    k = int(parse_flag_value(sys.argv, "--k", DEFAULT_K))
+
+    # hierarchical's result count is the sum of its per-cluster quotas, so an
+    # un-asked-for --k of 5 would silently throw away two thirds of the funnel.
+    allocation = None
+    if method == "hierarchical":
+        from hierarchicalsearch import DEFAULT_ALLOCATION, parse_allocation
+        allocation = parse_allocation(
+            parse_flag_value(sys.argv, "--allocation",
+                             ",".join(map(str, DEFAULT_ALLOCATION))))
+    default_k = sum(allocation) if allocation else DEFAULT_K
+    k = int(parse_flag_value(sys.argv, "--k", default_k))
     candidates = int(parse_flag_value(sys.argv, "--candidates", DEFAULT_CANDIDATES))
     do_rerank = "--rerank" in sys.argv
     rerank_model = parse_flag_value(sys.argv, "--rerank-model", DEFAULT_RERANK_MODEL)
@@ -435,7 +496,7 @@ def main():
             f"Run extractpdf.py --store (or loadmilvus.py) first.")
 
     results = search(client, query, method, model_name, k, candidates, ef,
-                     do_rerank, rerank_model, alpha, lambda_mult)
+                     do_rerank, rerank_model, alpha, lambda_mult, allocation)
     print_results(query, results, method, do_rerank, preview=preview)
 
 

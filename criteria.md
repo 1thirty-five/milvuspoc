@@ -1,45 +1,47 @@
-<!--
-What to cluster on, in words. Read by `python customcluster.py`.
-Full documentation: README.md -> "Clustering on your own criterion".
-
-Comment: A leading # is read as a section heading, so a #
-comment inside # Settings silently discards every setting below it.
-
-CURRENT CORPUS: fileinput/annual2603e.pdf - Nintendo Co., Ltd. Annual Report
-2026, 103 pages. The labels below mirror its statutory section order.
--->
-
 # Mode
 anchor
 
 
 # Labels
-<!-- `name: description`, one per line. The description is embedded with the
-name and carries most of the matching signal, so write it like you would explain
-the bucket to a colleague. `front matter` and `financial statements` are here to
-absorb navigation furniture and number tables; without them that text spreads
-across every real bucket. -->
-- front matter: table of contents with page numbers and dot leaders, cover page, translation disclaimer that the Japanese original shall prevail, investor relations contact information, independent auditor, company address
-- history and group structure: founded 1947 as a playing card manufacturer in Kyoto, successive changes of company name, stock exchange listings, subsidiaries and associates, consolidated group companies, percentage of voting rights held
-- business and strategy: management policy, business model, dedicated video game platform, integrated hardware and software development, Nintendo Switch, digital sales, expanding the number of people who have access to Nintendo IP, mid to long term strategy, issues to address
-- financial results: analysis of financial position and operating results by management, net sales, operating profit, ordinary profit, profit attributable to owners of parent, cash flows from operating investing and financing activities, segment performance, key financial data and trends
-- risk factors: risks that could adversely affect operating results share price and financial condition, intensifying competition, shifts in consumer preferences, dependence on hit software, foreign exchange rate fluctuation, intellectual property infringement, natural disaster and pandemic
-- sustainability and environment: approach to and initiatives for sustainability, sustainability priorities and material topics, climate related disclosure, greenhouse gas emissions, reducing environmental impact of products, supply chain and procurement policy, human rights
-- employees: human capital strategy, hiring and development of talent, training, diversity and inclusion, promoting a comfortable working environment, number of employees by segment, average years of service, wage differential between men and women, ratio of female managers
-- corporate governance: board of directors and outside directors, audit and supervisory committee, internal control system, remuneration and compensation of officers, policy on cross shareholdings, skills matrix, nomination and appointment of directors, career history of each officer
-- shares and dividends: total number of shares authorized and issued, share subscription rights, acquisition and cancellation of treasury shares, dividend policy, dividend per share, major shareholders and shareholding ratio, status of shares by shareholder type
-- facilities and R&D: overview of capital investments, major facilities and their book value, plans for new installation and retirement of equipment, research and development activities, underlying technology research, R&D expenditure
-- financial statements: consolidated balance sheet, consolidated statement of income and comprehensive income, notes to consolidated financial statements, significant accounting policies, depreciation method, deferred tax assets, millions of yen line items and totals
+- front matter and disclaimers: table of contents listing section titles followed by long rows of dots and a page number, chapter and item numbering such as I Overview of the Company and II Business Overview, cover page of the annual report, disclaimer that the Japanese original shall prevail over the English translation, note on the basis of preparing financial statements under Japanese accounting standards, investor relations contact information, company address in Kyoto and Redmond Washington
+- key financial data and trends: the five-year comparative summary table at the front of the report showing one column per fiscal year, capital adequacy ratio and return on equity ROE and price earnings ratio side by side across five years, net assets per share and earnings per share in yen and dollars, number of employees with the average number of temporary staff in parentheses, rate of return on investment ratios presented as a historical series rather than discussed in prose
+- company history: founded 1947 in Kyoto as a manufacturer of playing cards, successive changes of company name and capital, listing of shares on the Osaka and Tokyo Stock Exchanges, establishment of the New York and Washington subsidiaries and their absorption-type merger, relocation of the headquarters, transition to a company with an audit and supervisory committee
+- subsidiaries and group structure: list of consolidated subsidiaries and equity method associates, Nintendo of America Inc., Nintendo of Canada Ltd., Nintendo of Europe SE, Nintendo (Hong Kong) Limited, Nintendo of Taiwan, iQue China, location and share capital of each company, percentage of voting rights held, entrusted development of software, major financial information of significant subsidiaries
+- description of business: field of home entertainment, dedicated video game platform business, integrated development of hardware and software, manufacture and sale of home and handheld game systems and related software, smart device applications, IP related income and character licensing
+- management policy and strategy: basic management policy, business model and how value is created, expanding the number of people who have access to Nintendo IP, mid to long term management strategy, issues that should be addressed, why no specific management index targets are set, increasing corporate value over the mid to long term
+- sustainability approach and materiality: approach to and initiatives for sustainability, governance and risk management of sustainability topics, identification of material topics and priorities, stakeholder engagement with consumers business partners employees and local communities
+- climate and environmental initiatives: climate related disclosure and greenhouse gas emissions, reducing the environmental impact of products across the lifecycle from design to repair support and recycling, energy use, packaging materials, environmental targets and results
+- supply chain and human rights: procurement policy and CSR procurement guidelines, working conditions at production partners and suppliers, respect for human rights across the supply chain, audits of manufacturing partners, responsible sourcing of materials
+- competitive and market risks: intensifying competition in the entertainment industry, competition for consumers leisure time from other forms of entertainment, shifts in consumer preferences and tastes, risk that the platform fails to gain acceptance, seasonality and concentration of demand
+- product development and hit software risks: dependence on hit software titles, risk that development is suspended or aborted or that the original plan is delayed, large investments required in research development and marketing that may not become profitable, difficulty of predicting whether a title will succeed
+- intellectual property and counterfeiting risks: infringement of Nintendo's intellectual property rights, counterfeit and pirated products distributed over the internet, unauthorized circumvention of technical protection measures, claims that Nintendo infringes the intellectual property of third parties, litigation risk
+- financial exchange rate and disaster risks: foreign exchange rate fluctuation and its effect on financial position operating results and cash flows, holdings of foreign currency assets, risk of natural disaster earthquake and pandemic, disruption of the internet and network services, information security and personal data leakage
+- operating results analysis: analysis of operating results from management's viewpoint, net sales and operating profit and ordinary profit and profit attributable to owners of parent for the fiscal year, year on year percentage changes, hardware and software unit sales, digital sales of downloadable software, forward looking statements
+- cash flows and financial position: cash flows from operating investing and financing activities, balance of cash and cash equivalents, total assets and total liabilities and net assets, notes and accounts payable trade, income taxes payable, capital resources and liquidity, policy on the use of funds
+- sales by product type and region: breakdown of net sales by product type, sales of dedicated video game platform hardware and software, mobile and IP related income, sales by geographic region Japan the Americas Europe and other, year on year comparison by category
+- research and development: research and development activities and expenditure for the fiscal year, underlying and elemental technology research, development of hardware and software titles, Nintendo Classics and Super Nintendo Entertainment System services, outcomes of major research and development activities
+- facilities and capital investment: overview of capital investment during the fiscal year, major facilities of the parent company and subsidiaries with book value by category, buildings and structures and land area in square meters, tools furniture and fixtures, plans for new installation retirement or sale of equipment
+- shares and shareholders: total number of shares authorized and issued, common shares listed on the Tokyo Stock Exchange Prime Market, share subscription rights and stock option plans, status of shares by shareholder type, major shareholders and their shareholding ratio, shares less than one unit, status of the shareholder registry
+- treasury shares and dividends: acquisition of treasury shares by resolution of the Board of Directors, cancellation and retirement of treasury shares, shares transferred in association with a merger, basic policy on the distribution of profits, dividend per share and interim dividend, consolidated dividend payout ratio
+- corporate governance framework: corporate governance system and why it was adopted, Board of Directors and its composition, Audit and Supervisory Committee, nomination and compensation advisory committee, internal control system and compliance committee, director liability insurance contract, provisions of the articles of incorporation and requirements for special resolutions
+- directors and officers profiles: career history of each Director and Executive Officer with dates of appointment, outside directors and the reasons for their appointment, independence of outside officers as stipulated by the stock exchange, skills matrix and the expertise each officer contributes, terms of office, number of shares held by each officer
+- audit and supervisory committee: activities and attendance of Audit and Supervisory Committee members, coordination between the committee the internal auditing division and the accounting auditor, name and continuous audit period of the accounting auditor, audit fees paid to the auditor and its network firms, non-audit services such as tax advisory
+- officer remuneration: policy for determining the compensation of Directors and Executive Officers, fixed basic compensation and performance based short-term incentives and stock compensation as long-term incentives, operating profit as the benchmark for performance linked pay, total compensation by officer category, individual compensation disclosure for officers receiving over one hundred million yen
+- cross-shareholdings: investment shares held for purposes other than pure investment, shares held to maintain and develop business alliances and relationships, verification by the Board of Directors of the rationale for holding each issue, number of shares and carrying amount by issue, KONAMI DeNA KOEI TECMO and other holdings, shares held for pure investment purposes
+- human capital and employees: human capital strategy and Nintendo DNA of originality flexibility and sincerity, hiring and development of talent and training programmes, employee engagement survey and its purpose, promoting a comfortable working environment, number of employees by segment and average years of service and average annual salary, ratio of female managers and the wage differential between men and women
+- consolidated financial statements: consolidated balance sheet with current and non-current assets and liabilities, consolidated statement of income and comprehensive income, consolidated statement of changes in net assets, consolidated statement of cash flows, millions of yen line items and totals, valuation difference on available-for-sale securities and foreign currency translation adjustment
+- basis of consolidation and accounting policies: scope of consolidation and the number of consolidated subsidiaries and equity method associates, unconsolidated subsidiaries and why they are excluded, year-ends of consolidated subsidiaries that close on December 31, valuation standards for inventories and securities, depreciation method for property plant and equipment, accounting for goodwill, scope of cash and cash equivalents, provision for directors' compensation and retirement benefits
+- accounting estimates and new standards: significant accounting estimates and the assumptions behind them, recoverability of deferred tax assets, valuation of inventories and the probability that raw materials will be used or finished goods sold, changes in accounting policy and restatement of the previous fiscal year, accounting standards issued but not yet applied and the scheduled date and expected impact of application
+- financial instruments and fair value: condition of financial instruments and the policy for managing them, credit risk of counterparties and how it is monitored and reported to the Board, market risk and liquidity risk management, redemption schedule for monetary claims, fair value measurement hierarchy Level 1 Level 2 and Level 3, prices provided by financial institutions
+- securities and retirement benefits: held-to-maturity debt securities and other securities with fair value, acquisition cost and gain or loss on sale of equity and debt securities, defined benefit and defined contribution pension plans, beginning and ending balance of retirement benefit liability, discount rate and expected long-term return rate on plan assets
+- revenue recognition and contract balances: standards of accounting for significant revenue and expenses, breakdown of revenue from contracts with customers, allocation of the transaction price between each performance obligation, contract liabilities and the unused portion of virtual currency or digital points, transaction price allocated to remaining performance obligations
+- segment and geographic information: presentation as a single business segment with information by product type, sales and non-current assets by geographic area, information about major customers and the absence of any customer accounting for ten percent or more of net sales, related party transactions
+- subsequent events and supplementary schedules: significant subsequent events after the balance sheet date, per share information including net assets and earnings per share, issuance of shares in exchange for in-kind contribution of monetary compensation claims under the restricted stock plan, schedule of borrowings and lease obligations and their annual repayment amounts, supplementary schedules of bonds and provisions
 
 
 # Settings
-<!-- assign  seeded | hard
-     floor   auto (2 sigma below this run's mean) | a cosine | 0 to disable
-     model   MUST match the model the corpus was embedded with
-     scheme  name stored per row as `cluster_scheme`
-     preview member chunks printed per cluster -->
-assign = seeded
+assign = hard
 floor = auto
 model = bge-m3
-scheme = nintendo-ar2026
+scheme = nintendo-ar2026-v2
 preview = 6
