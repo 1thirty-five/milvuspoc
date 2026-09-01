@@ -713,7 +713,7 @@ def caption_figures(page_image, raw_text, page_number, backend, quant, url,
 
 
 def _pdf_pages(path, ocr, backend, dpi, min_chars, prompt, quant, url, progress,
-               figures=DEFAULT_OCR_FIGURES):
+               figures=DEFAULT_OCR_FIGURES, on_page=None):
     """Yield (page_number, text) for a PDF, OCR'ing pages according to `ocr`.
 
     The text layer is consulted first unless the mode is `always`, because
@@ -728,6 +728,11 @@ def _pdf_pages(path, ocr, backend, dpi, min_chars, prompt, quant, url, progress,
     shown = False                                 # did we print a progress line?
     try:
         for i in range(total):
+            # `progress` prints an in-place counter, which is right for a
+            # terminal and unreadable anywhere else. `on_page` is the same
+            # news as a call, for callers that render rather than print.
+            if on_page:
+                on_page(i + 1, total)
             page = pdf[i]
             text = ""
             if ocr != OCR_ALWAYS:
@@ -774,25 +779,33 @@ def _pdf_pages(path, ocr, backend, dpi, min_chars, prompt, quant, url, progress,
 def extract_pages(path, ocr=DEFAULT_OCR_MODE, backend=DEFAULT_OCR_BACKEND,
                   dpi=DEFAULT_OCR_DPI, min_chars=DEFAULT_OCR_MIN_CHARS,
                   prompt=DEFAULT_OCR_PROMPT, quant="auto", url=DEFAULT_OCR_URL,
-                  figures=DEFAULT_OCR_FIGURES, progress=False):
+                  figures=DEFAULT_OCR_FIGURES, progress=False, on_page=None):
     """Return [(page_number, text), ...] for a document (page numbers 1-based).
 
     PDFs are paginated; `.txt` files and images are single-"page" documents, so
     they come back as one entry, which keeps every caller on one shape.
+
+    `on_page(page_number, total)` is called as each page is reached, for a caller
+    that wants to show progress rather than print it. Single-page documents call
+    it once, so a caller never has to special-case them.
     """
     suffix = Path(path).suffix.lower()
 
     if suffix == ".txt":
+        if on_page:
+            on_page(1, 1)
         return [(1, Path(path).read_text(encoding="utf-8", errors="replace"))]
 
     if suffix in IMAGE_EXTS:
         if ocr == OCR_NEVER:                      # an image has no text layer to fall back on
             return []
+        if on_page:
+            on_page(1, 1)
         return [(1, clean_ocr_text(
             _ocr_image(path, backend, prompt, quant, url)))]
 
     return list(_pdf_pages(path, ocr, backend, dpi, min_chars, prompt, quant,
-                           url, progress, figures))
+                           url, progress, figures, on_page=on_page))
 
 
 def extract_text(path, **kwargs):
@@ -1195,13 +1208,18 @@ def find_documents(folder):
 
 
 def extract_records(path, max_chars=DEFAULT_MAX_CHARS, overlap=DEFAULT_OVERLAP,
-                    **kwargs):
+                    on_file=None, **kwargs):
     """Extract chunks from a file OR every supported file in a folder.
 
     Returns a list of {"text": chunk, "source": filename} records. A folder is
     walked one level deep over SUPPORTED_EXTS. `source` is the file name so each
     chunk stays traceable to its origin once stored. Extra keywords go to
-    extract_pages (`ocr`, `backend`, `dpi`, `min_chars`, `prompt`, ...).
+    extract_pages (`ocr`, `backend`, `dpi`, `min_chars`, `prompt`, ...) --
+    including `on_page`, which is how a caller follows a long file.
+
+    `on_file(index, total, path)` is called before each file is opened, so a
+    caller knows the size of the job from the first callback rather than having
+    to walk the folder itself first.
 
     A file yielding no text now means something is genuinely wrong with it —
     encrypted, corrupt, or blank — rather than "it was scanned", which OCR
@@ -1215,7 +1233,9 @@ def extract_records(path, max_chars=DEFAULT_MAX_CHARS, overlap=DEFAULT_OVERLAP,
             f"(looked for: {', '.join(sorted(SUPPORTED_EXTS))}).")
 
     records = []
-    for f in files:
+    for index, f in enumerate(files, start=1):
+        if on_file:
+            on_file(index, len(files), f)
         before = _OCR_STATS["pages"]
         try:
             chunks = extract_chunks(f, max_chars=max_chars, overlap=overlap,
