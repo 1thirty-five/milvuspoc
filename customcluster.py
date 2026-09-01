@@ -1,3 +1,4 @@
+
 """
 Cluster the stored document vectors by a criterion *you* define in words.
 

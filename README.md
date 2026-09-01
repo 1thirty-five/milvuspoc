@@ -5,9 +5,10 @@ documents, embed them with a sentence-transformer, store the vectors, then
 **search**, **cluster**, and **visualize** them.
 
 ```
- PDFs (fileinput/)  ──extractpdf.py──┐                                   ┌──> search.py        (6 retrieval methods + rerank)
+ PDFs (fileinput/)  ──extractpdf.py──┐                                   ┌──> search.py        (7 retrieval methods + rerank)
                                      ├──> embed ──> Milvus `documents` ──┼──> cluster.py       (KMeans -> `cluster` label)
  text  (input.md)   ──loadmilvus.py──┘        (HNSW / COSINE)            ├──> customcluster.py (criteria.md -> named clusters)
+                                                                         ├──> hierarchicalsearch.py (rank clusters -> 5/4/3/2/1)
                                                                          └──> visualize.py     (UMAP -> clusters.html)
 ```
 
@@ -99,6 +100,31 @@ python cluster.py
 python visualize.py                    # writes + opens clusters.html
 ```
 
+## The app
+
+Everything below is also a Streamlit front-end, which is the easier way to use
+any of it:
+
+```bash
+streamlit run app.py
+```
+
+Six pages: **Search** (all seven methods, every flag, including the hierarchical
+ones `search.py` can't reach), **Compare** (one query across several methods,
+with a Jaccard agreement matrix), **Ingest** (folder or upload, chunking, the
+full OCR flag set), **Clustering** (KMeans, or edit `criteria.md` in place and
+run it), **Visualise** (UMAP inline), and **Collection** (schema, sources,
+cluster breakdown, row browser, benchmark, drop).
+
+> Streamlit binds `0.0.0.0` by default and prints an external URL. Add
+> `--server.address localhost` if you don't want it reachable from your network.
+
+The UI is a thin layer over the same functions the CLIs call — see
+`milvusui/runner.py` for how modules that `print()` and `raise SystemExit` are
+adapted to it. One thing worth knowing: the backend caches are process-lifetime,
+so if you change the collection from a terminal while the server is running, hit
+**Refresh caches** in the sidebar.
+
 ## Ingesting documents
 
 ### From `input.md`
@@ -138,9 +164,34 @@ python extractpdf.py file.pdf --out input.md    # one file -> input.md bullets
 
 Text is split on sentence boundaries and packed into chunks that fit Milvus's
 `VARCHAR(2048)` `text` field. Each chunk carries its source filename in the
-dynamic `source` field, so results stay traceable to their document. PyMuPDF
-also opens XPS/EPUB/MOBI/FB2/CBZ/TXT. Scanned/image-only PDFs have no text layer
-and extract empty — that needs OCR (see `pdf-extractors.md`).
+dynamic `source` field, so results stay traceable to their document.
+
+Extraction is **pypdfium2**, so the supported set is `.pdf`, `.txt` and images
+(`.png .jpg .jpeg .tif .tiff .bmp .webp`) — the XPS/EPUB/MOBI/FB2/CBZ formats
+MuPDF handled are gone; images arrive in exchange, via OCR.
+
+### OCR
+
+A scanned PDF has no text layer and extracts empty, so `extractpdf.py` OCRs it.
+Images have no text layer by definition and are always OCR'd whole.
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--ocr auto\|always\|never` | `auto` | `auto` OCRs only pages whose text layer is too thin; `never` is text-layer only (and skips images). |
+| `--ocr-min-chars N` | `32` | `auto` only: fewer characters than this on a page means "no text layer". |
+| `--ocr-backend <name>` | `unlimited` | OCR engine. The default is a local VLM (`baidu/Unlimited-OCR`). |
+| `--ocr-dpi N` | `300` | Render resolution for the page image. |
+| `--ocr-quant auto\|none\|4bit\|8bit` | `auto` | Model quantisation. |
+| `--ocr-prompt <text>` | `document parsing.` | Prompt given to the VLM. |
+| `--ocr-url <url>` | `http://127.0.0.1:10000` | For server-style backends. |
+| `--ocr-figures` | off | Also parse detected figure regions. |
+
+> OCR output is part of the chunk hash, so changing any OCR setting produces
+> different text and re-embeds the affected chunks. That is correct — it *is*
+> different text — but it means OCR settings are not free to change. VLM decoding
+> is not bit-deterministic across driver or quantisation changes either, so
+> expect some churn. The default backend needs a GPU; without one use
+> `--ocr never` or a server backend.
 
 ### Re-ingesting is cheap: the collection is the cache
 
@@ -177,9 +228,10 @@ python search.py "multi-head attention" --method lexical
 python search.py "scaled dot-product" --method hybrid --rerank
 python search.py "attention" --method weighted --alpha 0.7
 python search.py "attention" --method mmr --lambda 0.5 --k 5
+python search.py "how is risk handled?" --method hierarchical
 ```
 
-Six techniques, chosen with `--method`:
+Seven techniques, chosen with `--method`:
 
 | Method | How it ranks | Good at |
 |--------|--------------|---------|
@@ -189,6 +241,7 @@ Six techniques, chosen with `--method`:
 | `hybrid` **(default)** | Runs dense + lexical, fuses by Reciprocal Rank Fusion. | The strong default: semantic recall + keyword precision. |
 | `weighted` | Weighted sum of min-max-normalized dense & lexical scores. | When you want an explicit dial (`--alpha`) instead of RRF. |
 | `mmr` | Dense, then Maximal Marginal Relevance re-selection. | Avoiding near-duplicate results (`--lambda`). |
+| `hierarchical` | Ranks the **clusters** against the query, then takes 5/4/3/2/1 chunks from the top five. | Broad or exploratory queries: guarantees coverage of five regions instead of 15 hits from one. Needs cluster labels. |
 
 Add `--rerank` to any method: a cross-encoder re-scores the shortlist by reading
 the query and each chunk **together**, then keeps the top `--k`. More accurate
@@ -201,11 +254,163 @@ ordering, at the cost of a model pass per candidate.
 | `--ef N` | `max(64, candidates)` | HNSW search width. Higher = better recall, slower. |
 | `--alpha F` | `0.5` | `weighted` only. `1.0` = all dense, `0` = all lexical. |
 | `--lambda F` | `0.5` | `mmr` only. `1.0` = pure relevance, `0` = pure diversity. |
+| `--allocation a,b,c` | `5,4,3,2,1` | `hierarchical` only. Chunks taken from the 1st, 2nd, … ranked cluster. |
 | `--rerank-model <id>` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Cross-encoder to rerank with. |
 
-> Dense/hybrid/weighted/mmr embed the query, so `--model` must match the model
-> the stored vectors were built with. `search.py` checks the dimension and exits
-> with a clear error on mismatch. `lexical` and `tfidf` need no model at all.
+> Dense/hybrid/weighted/mmr/hierarchical embed the query, so `--model` must match
+> the model the stored vectors were built with. `search.py` checks the dimension
+> and exits with a clear error on mismatch. `lexical` and `tfidf` need no model
+> at all.
+
+### Hierarchical search
+
+Every other technique searches the whole pot at once. `hierarchical` does it in
+two stages: score each **cluster** against the query (cosine to the cluster
+centroid), then run a cluster-restricted dense search against the winners with a
+decreasing quota — 5 chunks from the best cluster, 4 from the 2nd, 3 from the
+3rd, 2 from the 4th, 1 from the 5th. Fifteen results that span five regions of
+the corpus by construction, weighted toward the best one but never owned by it.
+It's diversification like `mmr`, but at cluster granularity and reserved up
+front rather than penalised per result.
+
+The trade: if the answer lives entirely in cluster 1, six of the fifteen seats
+are spent elsewhere. Use it for survey questions, not pinpoint lookups.
+
+Run `cluster.py` or `customcluster.py` first — with no `cluster` labels there is
+nothing to rank, and it says so. `hierarchicalsearch.py` also has its own CLI,
+which prints the cluster leaderboard (which cluster won, by what cosine, and how
+many chunks it contributed) before the results:
+
+```bash
+python hierarchicalsearch.py "how is risk handled?"
+python hierarchicalsearch.py "how is risk handled?" --adaptive  # shape from the scores
+python hierarchicalsearch.py "attention" --allocation 8,4,2,1   # steeper funnel
+python hierarchicalsearch.py "pricing" --rank-by name           # rank by cluster label
+python hierarchicalsearch.py "BLEU" --sort score --rerank
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--allocation a,b,c` | `5,4,3,2,1` | Per-rank quotas. Length = how many clusters get searched. |
+| `--adaptive` | off | Derive the funnel's shape from the cluster scores; `--allocation` then sets only the total and the cluster count. |
+| `--sharpness F` | `1.0` | `--adaptive` only. How hard score gaps are amplified. `0` = even split. |
+| `--floor auto\|off\|F` | `off` | Make each quota a cap: drop picks below the cutoff instead of padding the seat. `auto:M` tunes the multiple (default 1.5). |
+| `--hybrid` | off | Add a BM25 pass inside each selected cluster, RRF-fused with the dense one. |
+| `--rank-by` | `probe` | `probe` = one flat sweep, score each cluster by the mean of its best 3 hits. `centroid` = mean of member vectors. `name` = embed the label as `name: description`. |
+| `--probe N` | `300` | `--rank-by probe` only. Depth of the flat sweep. |
+| `--criteria <path>` | `criteria.md` | `--rank-by name` only. Where to read the label descriptions from. |
+| `--sort` | `cluster` | `cluster` keeps the funnel order; `score` re-sorts everything by cosine. |
+| `--include-unassigned` | off | Let the `unassigned` bucket (`cluster = -1`) compete for a slot. |
+| `--no-pool-reuse` | off | Go back to one filtered search per cluster instead of taking chunks from the probe pool. Diagnostic; see below. |
+
+A cluster smaller than its quota simply contributes fewer chunks — nothing is
+backfilled from another cluster, since that would undo the guarantee the
+allocation exists to make.
+
+**`--floor auto` makes the quota a cap.** A cluster told to produce 5 chunks
+when it has 3 worth having will otherwise pad the rest with whatever it had
+left. The cutoff is the score of the (1.5 × budget)-th best chunk in the probe
+pool — read off this query's own distribution, not an absolute cosine, for the
+reason `cluster.py` documents at `DEFAULT_FLOOR_SIGMA`. It's a precision-vs-
+coverage dial: measured over three queries on the Nintendo corpus it keeps
+15/12/12 of 15 seats at the default 1.5, 14/11/12 at `auto:1.2`, and 15/13/15
+at `auto:2.0` (nearly inert). Empty seats are reported, never backfilled.
+
+**`--hybrid` adds BM25 inside each selected cluster**, RRF-fused with the dense
+pass, for queries that hinge on an exact token. `score` then becomes the RRF
+score and the cosine is printed beside it. Combined with `--floor`, BM25 ranks
+only over chunks that clear the floor — otherwise a lexical hit sharing one
+token with the query walks into a seat the floor just emptied (measured: 9 of
+15 seats, on "Nintendo Switch 2 hardware sales"). Restricting BM25's corpus does
+change its IDF and average-document-length statistics, but measurably for the
+better here: in cluster 2 the unfiltered BM25 top 5 is chunks that merely repeat
+the token (cosines 0.24–0.33), and the chunk listing the actual subsidiaries
+climbs from BM25 rank 11 to rank 3 once the corpus is restricted.
+
+**Why `probe` and not `centroid`?** A centroid is the mean of *every* member, so
+a large heterogeneous cluster averages out toward the corpus mean. Measured on
+the Nintendo corpus with the query *"where are the subsidiaries"*, centroid
+ranking spread all 12 clusters across a 0.13 cosine band — consecutive ranks
+differed by ~0.003, which is noise — and ranked `corporate governance` **8th of
+12** even though it held the 2nd-best chunk in the whole corpus. Probing scores
+a cluster by the best material it actually has for *this* query, which is what
+stage 2 is about to retrieve anyway. It is also cheaper: one ANN search instead
+of reading every stored vector.
+
+| Ranking | Top-5 clusters for "where are the subsidiaries" |
+|---|---|
+| `centroid` | front matter, shares and dividends, business and strategy, employees, financial results |
+| `probe` | front matter, business and strategy, financial results, corporate governance, shares and dividends |
+
+The second list is the one holding the consolidation notes, the subsidiary
+table, the subsidiaries' year-ends and the governance-of-subsidiaries text.
+
+### Stage 2 takes its chunks from the probe pool
+
+The probe is already a cosine-ranked sweep with every hit's cluster attached —
+that is how stage 1 ranks anything. So when the pool covers a cluster's quota,
+re-asking Milvus for the same chunks under a `cluster == n` filter buys nothing
+but a round trip. Stage 2 slices the pool, falling back to the filtered search
+only for a cluster the pool didn't cover. `--no-pool-reuse` forces the old path.
+
+Safe because the pool is the *higher*-recall read: the flat sweep sees each
+cluster at `ef = --probe`, the filtered search at `ef = 64`. Over 25 queries × 3
+configurations (default, `--floor auto`, `--allocation 8,4,2,1`) the two paths
+returned **byte-identical results in 75 of 75 cases**.
+
+| Path | calls/query | median ms |
+|---|---|---|
+| one filtered search per cluster | 7.0 | 40.9 |
+| pool reuse | 2.5 | 32.1 |
+| pool reuse, warm process | 1.5 | 27.7 |
+| `--hybrid --floor auto`, cold | 12.0 | 999.3 |
+| `--hybrid --floor auto`, warm | 7.7 | 280.0 |
+
+"Warm" is the second and later query in one process — what a UI or sweep does.
+The `--hybrid` rows matter most: that path pages whole clusters out of Milvus and
+builds a BM25 index over each, none of which depends on the query.
+
+> **Long-lived processes cache the collection.** `has_cluster_names`,
+> `cluster_scheme`, each cluster's text and its BM25 index are cached per process
+> (`hierarchicalsearch.clear_caches()`); `search.py` caches its BM25 index keyed
+> by row ids. A CLI run is unaffected. **Re-ingesting inside a running process
+> needs `clear_caches()`**, or those reads are stale.
+
+### Thin clusters are scored on what they have — on purpose
+
+`probe` scores a cluster by the mean of its best three hits; a cluster with fewer
+than three is scored on what it has, not penalised for the shortfall. That reads
+like a bug — one chunk at 0.65 outranks three at 0.64/0.63/0.62, the "one lucky
+chunk carries the cluster" case the mean exists to prevent.
+
+Penalising it was tried and measured **wrong**. Hit count conflates relevance
+with cluster *size*: a small cluster cannot place many chunks in the pool however
+well it matches. Padding the missing slots with the pool's weakest score, over 25
+queries, changed the top-5 on 3 and the top-3 on 2 — and the clusters it demoted
+out of rank 1 were `financial exchange rate and disaster risks` for "foreign
+exchange rate risk" and `climate and environmental initiatives` for "greenhouse
+gas emissions", both on 2 pool hits. Both are exactly the right cluster, and both
+are thin because they are small.
+
+Any penalty proportional to hit count therefore demotes the narrow,
+precisely-matching cluster — the case the technique most needs to get right. The
+real cost (a 2-hit cluster taking a quota of 5 and padding from chunks that never
+made the pool) belongs to allocation, not ranking, and `--floor auto` already
+handles it by making the quota a cap.
+
+> **`--rank-by name` reads `criteria.md`.** Milvus stores only the label's
+> *name*; the description that `customcluster.py` actually embedded to place the
+> rows isn't stored anywhere. Three words rank far worse than the sentence, so
+> name mode reads the descriptions back out of the criterion file and ranks on
+> the same `name: description` anchor text the clustering used. If the file is
+> missing it falls back to bare names; if the file's `scheme` no longer matches
+> the collection's `cluster_scheme` it says so and ignores the descriptions.
+>
+> Name mode is only as good as the agreement between your labels and their
+> members. Under `assign = seeded` the centroids move off your anchors, and the
+> names can end up describing something other than what's in the bucket — at
+> which point `centroid` is the honest ranking and `name` is ranking a fiction.
+> Use `assign = hard` if you want name mode to be trustworthy.
 
 ## Clustering and visualizing
 
@@ -228,10 +433,11 @@ client.query(collection_name="documents", filter="cluster == 3",
 embedding space) and writes an interactive Plotly scatter, colored by cluster,
 hovering to show the document text.
 
-> **Gotcha:** `cluster.py` rebuilds the collection with only `text`, `embedding`,
-> and `cluster` — it **drops the `source` field**. After clustering a PDF ingest,
-> `search.py` will print `source=None`. Re-run `extractpdf.py --store` to get
-> provenance back (which in turn clears the `cluster` labels).
+> **It rebuilds the collection**, dropping and recreating it from the rows it
+> read. `store_labels` therefore carries every field back through — `source`,
+> `seq` and `chunk_hash` as well as the label — because anything left out is
+> destroyed for good: `source` is what results are attributed to, and losing
+> `chunk_hash` would force a full re-embed on the next ingest.
 
 ## Clustering on your own criterion
 
@@ -419,17 +625,20 @@ query time.
 | File | Purpose |
 |------|---------|
 | `loadmilvus.py` | Embed `input.md` and store it. Core helpers (`get_model`, `connect`, `ensure_collection`, `embed`, `store`) reused by every other script. |
-| `extractpdf.py` | Extract + chunk documents from `fileinput/` with PyMuPDF, store them with a `source` field. |
-| `search.py` | Retrieval front-end: dense / lexical / tfidf / hybrid / weighted / mmr, plus cross-encoder reranking. |
+| `extractpdf.py` | Extract + chunk documents from `fileinput/` with pypdfium2 (plus OCR for scans and images), store them with a `source` field. |
+| `search.py` | Retrieval front-end: dense / lexical / tfidf / hybrid / weighted / mmr / hierarchical, plus cross-encoder reranking. |
+| `hierarchicalsearch.py` | Two-stage search: rank the clusters, then take 5/4/3/2/1 chunks from the top five. Own CLI; also `search.py --method hierarchical`. |
 | `cluster.py` | KMeans over the stored vectors; writes a `cluster` label back into Milvus. |
 | `customcluster.py` | Clustering on a user-defined criterion read from `criteria.md`. |
 | `criteria.md` | What to cluster on: mode, labels, settings. Documented in this README. |
 | `visualize.py` | UMAP projection of the vectors to an interactive Plotly scatter. |
 | `benchmark.py` | Measure the storing pipeline → `statistics.md`. |
+| `app.py` | Streamlit front-end. Page registration and the connection check only. |
+| `milvusui/` | The UI: `runner.py` (adapts print/SystemExit), `resources.py` (cached client, models, collection state), `components.py` (shared widgets), `views/` (one module per page). |
+| `test_ui.py` | Headless render + interaction test for every page (`python test_ui.py`). |
 | `input.md` | Documents to index (bullets under `# Documents`). |
 | `fileinput/` | Drop PDFs here for `extractpdf.py`. Contents git-ignored. |
 | `docker-compose.yml` | Milvus standalone + its named data volume. |
-| `pdf-extractors.md` | Why PyMuPDF, and the OCR story for scanned PDFs. |
 | `requirements.txt` | Python dependencies. |
 
 Generated, git-ignored: `result.py` (full vectors), `statistics.md` (benchmarks),
@@ -439,6 +648,11 @@ Generated, git-ignored: `result.py` (full vectors), `statistics.md` (benchmarks)
 
 - The embedding model downloads on first use and is cached locally (`bge-m3` is
   a few GB; `minilm` is ~80MB).
+- **Searching in a loop? Pass `model=`.** `search.search` otherwise calls
+  `get_model` per query, which re-reads the weights from the local cache every
+  time — ~10s for bge-m3. Invisible to a CLI run that searches once and exits;
+  crippling to a UI, sweep or eval loop. `hierarchical_search` already takes the
+  model as an argument. Measured: 9.8s → 0.27s per repeated query.
 - `lexical` / `hybrid` / `weighted` pull the whole corpus client-side for BM25 —
   fine at POC scale, not how you'd do it in production (Milvus has a native
   sparse/BM25 field for that).
