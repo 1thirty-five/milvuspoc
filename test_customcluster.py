@@ -89,9 +89,6 @@ anchor
 1. onboarding: getting a new customer started
 - bare name with no description
 
-# Axes
-- technical vs business
-- formal : casual
 
 # Settings
 assign = hard
@@ -109,8 +106,6 @@ preview = 3
                           "bare name with no description"])
         self.assertEqual(config["labels"][0][1], "fees, discounts, billing")
         self.assertEqual(config["labels"][3][1], "")
-        self.assertEqual(config["axes"],
-                         [("technical", "business"), ("formal", "casual")])
         self.assertEqual(config["assign"], "hard")
         self.assertAlmostEqual(config["floor"], 0.35)
         self.assertEqual(config["model"], "minilm")
@@ -122,7 +117,7 @@ preview = 3
         path = write_criteria("""
 <!--
 # Mode
-axes
+kmeans
 # Labels
 - decoy: this must never be read
 -->
@@ -141,10 +136,6 @@ anchor
         path = write_criteria("# Mode\nanchor\n# Labels\n- a: x\n- b: y\n- c: z\n"
                               "# Settings\nk = 99\n")
         self.assertEqual(cc.parse_criteria(path)["k"], 3)
-
-    def test_axes_k_comes_from_settings(self):
-        path = write_criteria("# Mode\naxes\n# Axes\n- a vs b\n# Settings\nk = 5\n")
-        self.assertEqual(cc.parse_criteria(path)["k"], 5)
 
     def test_defaults_when_settings_absent(self):
         path = write_criteria("# Mode\nanchor\n# Labels\n- a: x\n- b: y\n")
@@ -168,19 +159,6 @@ anchor
         config = cc.parse_criteria(shipped)
         self.assertIn(config["mode"], cc.MODES)
         self.assertGreaterEqual(len(config["labels"]), 2)
-        self.assertGreaterEqual(len(config["axes"]), 1)
-
-    def test_axis_separators(self):
-        for line, expected in [
-            ("technical vs business", ("technical", "business")),
-            ("technical vs. business", ("technical", "business")),
-            ("technical VS business", ("technical", "business")),
-            ("technical : business", ("technical", "business")),
-            # `vs` wins over a colon, so a pole may contain a colon itself.
-            ("note: formal vs casual", ("note: formal", "casual")),
-        ]:
-            with self.subTest(line=line):
-                self.assertEqual(cc.split_axis(line), expected)
 
     def test_bullet_markers(self):
         for line in ("- pricing", "* pricing", "+ pricing", "1. pricing"):
@@ -208,7 +186,7 @@ class TestValidation(unittest.TestCase):
         self.assertIn("not found", str(caught.exception))
 
     def test_no_mode(self):
-        self.assert_rejects("# Labels\n- a: x\n- b: y\n", "No mode", "anchor, axes")
+        self.assert_rejects("# Labels\n- a: x\n- b: y\n", "No mode", "anchor")
 
     def test_unknown_mode(self):
         self.assert_rejects("# Mode\nkmeans\n# Labels\n- a: x\n- b: y\n",
@@ -216,9 +194,6 @@ class TestValidation(unittest.TestCase):
 
     def test_anchor_needs_two_labels(self):
         self.assert_rejects("# Mode\nanchor\n# Labels\n- a: x\n", "at least 2")
-
-    def test_axes_needs_an_axis(self):
-        self.assert_rejects("# Mode\naxes\n", "no axes")
 
     def test_setting_without_equals(self):
         self.assert_rejects("# Mode\nanchor\n# Labels\n- a: x\n- b: y\n"
@@ -235,15 +210,6 @@ class TestValidation(unittest.TestCase):
     def test_bad_assign(self):
         self.assert_rejects("# Mode\nanchor\n# Labels\n- a: x\n- b: y\n"
                             "# Settings\nassign = fuzzy\n", "seeded", "hard")
-
-    def test_axes_k_below_two(self):
-        self.assert_rejects("# Mode\naxes\n# Axes\n- a vs b\n# Settings\nk = 1\n",
-                            "at least 2")
-
-    def test_malformed_axis(self):
-        with self.assertRaises(SystemExit) as caught:
-            cc.split_axis("justoneword")
-        self.assertIn("two poles", str(caught.exception))
 
 
 # --------------------------------------------------------------------------
@@ -273,14 +239,16 @@ class TestAnchorMode(unittest.TestCase):
         self.assertEqual(seen["texts"], ["a: first", "b"])
 
     def test_hard_assign_recovers_planted_topics(self):
-        labels, similarity = quietly(cc.assign_anchors, self.docs, self.topics, "hard")
+        labels, similarity = quietly(cc.assign_anchors, self.docs, self.topics,
+                                     "hard", 0.0)
         np.testing.assert_array_equal(labels, self.truth)
         # Returned similarity is the row's cosine to what it was assigned to.
         expected = (self.docs @ self.topics.T).max(axis=1)
         np.testing.assert_allclose(similarity, expected, atol=1e-5)
 
     def test_seeded_assign_recovers_planted_topics(self):
-        labels, _ = quietly(cc.assign_anchors, self.docs, self.topics, "seeded")
+        labels, _ = quietly(cc.assign_anchors, self.docs, self.topics,
+                            "seeded", 0.0)
         np.testing.assert_array_equal(labels, self.truth)
 
     def test_seeded_preserves_label_order(self):
@@ -291,10 +259,11 @@ class TestAnchorMode(unittest.TestCase):
         still looking perfectly reasonable. Shuffling the anchors must permute
         the output labels in exactly the same way.
         """
-        labels, _ = quietly(cc.assign_anchors, self.docs, self.topics, "seeded")
+        labels, _ = quietly(cc.assign_anchors, self.docs, self.topics,
+                            "seeded", 0.0)
         order = [2, 0, 1]
         shuffled, _ = quietly(
-            cc.assign_anchors, self.docs, self.topics[order], "seeded")
+            cc.assign_anchors, self.docs, self.topics[order], "seeded", 0.0)
         inverse = np.argsort(order)
         np.testing.assert_array_equal(shuffled, inverse[labels])
 
@@ -339,107 +308,12 @@ class TestAnchorMode(unittest.TestCase):
         self.assertFalse(np.allclose(similarity, to_anchor, atol=1e-3))
 
     def test_stats_report_similarity_per_cluster(self):
-        labels, similarity = quietly(cc.assign_anchors, self.docs, self.topics, "hard")
+        labels, similarity = quietly(cc.assign_anchors, self.docs, self.topics,
+                                     "hard", 0.0)
         stats = cc.anchor_stats(labels, similarity, 3)
         self.assertEqual(set(stats), {0, 1, 2})
         for text in stats.values():
             self.assertIn("cosine mean", text)
-
-
-# --------------------------------------------------------------------------
-# axes mode
-# --------------------------------------------------------------------------
-
-class TestAxesMode(unittest.TestCase):
-
-    def setUp(self):
-        rng = np.random.default_rng(SEED)
-        self.left, self.right = unit(rng.normal(size=(2, DIM)))
-
-    def fake_embed_poles(self):
-        """Embed 'left'/'right' to the fixed poles; anything else to noise."""
-        rng = np.random.default_rng(3)
-        table = {"left": self.left, "right": self.right}
-
-        def fake_embed(model, texts):
-            return np.asarray(
-                [table.get(t, unit(rng.normal(size=DIM))) for t in texts],
-                dtype="float32")
-        return fake_embed
-
-    def test_direction_is_the_normalized_difference(self):
-        with patch.object(cc, "embed", self.fake_embed_poles()):
-            directions = quietly(cc.axis_directions, "MODEL", [("left", "right")])
-        expected = self.left - self.right
-        np.testing.assert_allclose(
-            directions[0], expected / np.linalg.norm(expected), atol=1e-5)
-        np.testing.assert_allclose(np.linalg.norm(directions[0]), 1.0, atol=1e-5)
-
-    def test_projection_sign_follows_the_poles(self):
-        """A chunk near the left pole scores positive, near the right negative."""
-        with patch.object(cc, "embed", self.fake_embed_poles()):
-            directions = quietly(cc.axis_directions, "MODEL", [("left", "right")])
-        raw = np.vstack([self.left, self.right]) @ directions.T
-        self.assertGreater(raw[0, 0], 0)
-        self.assertLess(raw[1, 0], 0)
-
-    def test_identical_poles_are_rejected(self):
-        with patch.object(cc, "embed",
-                          lambda model, texts: np.ones((len(texts), DIM), "float32")):
-            with self.assertRaises(SystemExit) as caught:
-                quietly(cc.axis_directions, "MODEL", [("same", "same")])
-        self.assertIn("no direction", str(caught.exception))
-
-    def test_projection_is_standardized(self):
-        rng = np.random.default_rng(11)
-        docs = unit(rng.normal(size=(40, DIM)))
-        directions = unit(rng.normal(size=(2, DIM)))
-        coords = cc.project_onto_axes(docs, directions)
-        np.testing.assert_allclose(coords.mean(axis=0), [0, 0], atol=1e-5)
-        np.testing.assert_allclose(coords.std(axis=0), [1, 1], atol=1e-5)
-
-    def test_standardizing_makes_axes_count_equally(self):
-        """An axis with a wider spread must not dominate purely by scale.
-
-        Scaling one axis' raw projections must leave the standardized
-        coordinates -- and therefore the clustering -- unchanged.
-        """
-        rng = np.random.default_rng(13)
-        docs = unit(rng.normal(size=(40, DIM)))
-        directions = unit(rng.normal(size=(2, DIM)))
-        coords = cc.project_onto_axes(docs, directions)
-        # Halving a direction halves its raw projections; z-scoring undoes it.
-        stretched = cc.project_onto_axes(docs, directions * np.array([[1.0], [0.5]],
-                                                                    dtype="float32"))
-        np.testing.assert_allclose(coords, stretched, atol=1e-4)
-
-    def test_constant_axis_does_not_divide_by_zero(self):
-        """A degenerate axis (zero spread) must not produce NaNs."""
-        docs = np.tile(unit(np.arange(DIM)), (10, 1)).astype("float32")
-        directions = unit(np.random.default_rng(5).normal(size=(1, DIM)))
-        coords = cc.project_onto_axes(docs, directions)
-        self.assertFalse(np.isnan(coords).any())
-
-    def test_clusters_are_named_by_the_pole_they_lean_toward(self):
-        axes = [("technical", "business"), ("formal", "casual")]
-        coords = np.array([[+1.0, +1.0],      # cluster 0: technical + formal
-                           [-1.0, -1.0]])     # cluster 1: business + casual
-        labels = np.array([0, 1])
-        self.assertEqual(cc.name_axis_clusters(labels, coords, axes, 2),
-                         ["technical + formal", "business + casual"])
-
-    def test_duplicate_names_are_disambiguated(self):
-        """Names are stored as `cluster_name` and used as a filter value."""
-        axes = [("technical", "business")]
-        coords = np.array([[1.0], [2.0]])
-        names = cc.name_axis_clusters(np.array([0, 1]), coords, axes, 2)
-        self.assertEqual(len(set(names)), 2, f"names collided: {names}")
-        self.assertEqual(names[0], "technical")
-
-    def test_empty_cluster_is_named_not_crashed(self):
-        coords = np.array([[1.0], [1.0]])
-        names = cc.name_axis_clusters(np.array([0, 0]), coords, [("a", "b")], 2)
-        self.assertEqual(len(names), 2)
 
 
 # --------------------------------------------------------------------------
@@ -574,9 +448,8 @@ class TestEndToEnd(unittest.TestCase):
         return output.getvalue()
 
     ANCHOR = ("# Mode\nanchor\n# Labels\n- alpha: first\n- beta: second\n"
-              "- gamma: third\n# Settings\nassign = seeded\nscheme = synth\n")
-    AXES = ("# Mode\naxes\n# Axes\n- sharp vs blurry\n- loud vs quiet\n"
-            "# Settings\nk = 3\nscheme = synth-axes\n")
+              "- gamma: third\n# Settings\nassign = seeded\nfloor = 0\n"
+              "scheme = synth\n")
 
     def test_anchor_run_stores_names_matching_the_planted_topics(self):
         self.run_main(self.ANCHOR)
@@ -594,27 +467,15 @@ class TestEndToEnd(unittest.TestCase):
             self.assertIsInstance(label, int)
             self.assertIsInstance(name, str)
 
-    def test_axes_run_stores_pole_names(self):
-        self.run_main(self.AXES)
-        self.assertEqual(self.stored["scheme"], "synth-axes")
-        self.assertEqual(len(set(self.stored["names"])), 3)
-        for name in set(self.stored["names"]):
-            self.assertTrue(any(pole in name for pole in
-                                ("sharp", "blurry", "loud", "quiet")), name)
-
     def test_dry_run_writes_nothing(self):
         output = self.run_main(self.ANCHOR, "--dry-run")
         self.assertEqual(self.stored, {})
         self.assertIn("nothing written", output)
 
-    def test_k_override_applies_in_axes_mode(self):
-        self.run_main(self.AXES, "--k", "2")
-        self.assertEqual(len(set(self.stored["names"])), 2)
-
-    def test_k_override_rejected_in_anchor_mode(self):
+    def test_k_override_is_refused(self):
         with self.assertRaises(SystemExit) as caught:
             self.run_main(self.ANCHOR, "--k", "5")
-        self.assertIn("does not apply in anchor mode", str(caught.exception))
+        self.assertIn("--k is not accepted", str(caught.exception))
 
     def test_floor_labels_are_named_unassigned(self):
         """A row below the floor must get the name, not an IndexError on names[-1]."""
@@ -639,7 +500,7 @@ class TestEndToEnd(unittest.TestCase):
     def test_k_larger_than_the_corpus_is_caught(self):
         self.rows = self.rows[:2]
         with self.assertRaises(SystemExit) as caught:
-            self.run_main(self.AXES)
+            self.run_main(self.ANCHOR)
         self.assertIn("Cannot make 3 clusters", str(caught.exception))
 
     def test_criterion_is_echoed_before_any_work(self):

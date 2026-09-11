@@ -39,7 +39,7 @@ import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 
-from loadmilvus import DEFAULT_COLLECTION, connect
+from loadmilvus import DEFAULT_COLLECTION, connect, live_row_count
 
 # Rows per query_iterator page. Only bounds memory per round-trip, not the total.
 FETCH_BATCH = 1000
@@ -90,7 +90,7 @@ def fetch_embeddings(client, collection=DEFAULT_COLLECTION, batch_size=FETCH_BAT
     finally:
         iterator.close()
 
-    expected = client.get_collection_stats(collection)["row_count"]
+    expected = live_row_count(client, collection)
     if len(vectors) != expected:
         print(f"Warning: read {len(vectors)} rows but '{collection}' holds "
               f"{expected}. Sweeping the rows that came back.")

@@ -26,18 +26,34 @@ from .runner import call
 # value on its arguments, so a version counter is how you say "this depends on
 # mutable state you cannot see".
 #
+# Two things about it are load-bearing and neither is obvious.
+#
 # The parameter it arrives on MUST NOT be named with a leading underscore.
 # st.cache_data deliberately excludes underscore-prefixed arguments from the
 # hash key -- that is how you pass an unhashable handle like a db connection --
 # so a `_version` parameter is invisible to the cache and every function below
 # would serve its first result for the life of the server: ingesting or
 # re-clustering would change nothing on screen until a restart.
-_VERSION = 0
+#
+# And the counter lives in an st.cache_resource box rather than in a plain
+# module global. A bare global resets to 0 every time Streamlit reloads this
+# module, which it does on any edit to a project file -- the whole point of hot
+# reload -- while the cache_data entries keyed on the versions already issued
+# stay in the runtime cache. The counter then hands out version 0 a second time
+# and every function below answers with the snapshot taken at server start: a
+# collection ingested, re-clustered and re-counted since goes on reporting the
+# numbers it had an hour ago, and only the manual "Refresh caches" button digs
+# it out. cache_resource survives a reload the same way cache_data does, so the
+# count never rewinds and a spent version is never reissued.
+@st.cache_resource(show_spinner=False)
+def _version_box():
+    """One mutable counter per server, immune to module reload."""
+    return {"n": 0}
 
 
 def data_version():
     """Current collection-state version; changes whenever the UI writes."""
-    return _VERSION
+    return _version_box()["n"]
 
 
 def invalidate():
@@ -48,8 +64,7 @@ def invalidate():
     (cluster texts, BM25 indexes, `cluster_name` probes), which would otherwise
     keep serving pre-ingest data for the life of the server.
     """
-    global _VERSION
-    _VERSION += 1
+    _version_box()["n"] += 1
     hierarchicalsearch.clear_caches()
     search._BM25_CACHE.clear()
 
@@ -113,7 +128,10 @@ def collection_fingerprint(collection=DEFAULT_COLLECTION, uri=DEFAULT_URI):
         client = get_client(uri)
         if not client.has_collection(collection):
             return ("absent",)
-        rows = int(client.get_collection_stats(collection)["row_count"])
+        # The live count, not the stats one -- stats keeps counting soft-deleted
+        # rows until a compaction runs, so a delete would not move the
+        # fingerprint and the poll would sleep straight through it.
+        rows = loadmilvus.live_row_count(client, collection)
         if not rows:
             return ("empty",)
         try:
@@ -143,7 +161,7 @@ def collection_info(version, collection=DEFAULT_COLLECTION, uri=DEFAULT_URI):
     described = client.describe_collection(collection)
     fields = {f["name"]: f for f in described["fields"]}
     dim = fields.get("embedding", {}).get("params", {}).get("dim")
-    rows = client.get_collection_stats(collection)["row_count"]
+    rows = loadmilvus.live_row_count(client, collection)
 
     info = {
         "exists": True,

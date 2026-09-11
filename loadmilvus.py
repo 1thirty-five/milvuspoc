@@ -48,12 +48,26 @@ DEFAULT_RESULT = "result.py"
 # this, so corpus size stops being a correctness question.
 INSERT_BATCH = 1000
 
+# Capacity of the `text` field. Milvus measures VARCHAR in **bytes**, while every
+# chunking knob in this pipeline is in characters -- the two agree only on pure
+# ASCII. The old 2048 was under one page of CJK: at the default 600-char chunk
+# size a Chinese document reaches ~3600 bytes, three bytes per character, and
+# Milvus rejects the insert *after* the embeddings have been paid for. 65535 is
+# the format's own maximum, and an unused byte of it costs nothing.
+TEXT_MAX_BYTES = 65535
+
 # Named model presets — pick one per run with `--model <key>` (see main()).
 # Each entry needs an "id" (the Hugging Face model id); these optional keys let a
 # preset carry model-specific needs without touching the pipeline:
 #   "trust_remote_code": True   -> passed to SentenceTransformer() at load
 #   "doc_prefix": "..."         -> prepended to every document before embedding
 #                                  (e.g. nomic-embed needs "search_document: ")
+#   "query_prefix": "..."       -> the matching string for a *query*
+#                                  (nomic-embed: "search_query: "). A preset with
+#                                  a doc_prefix and no query_prefix embeds queries
+#                                  bare, which is right for a model whose asymmetry
+#                                  is one-sided and wrong for one that wants both --
+#                                  so say both when the model does.
 # A `--model` value that isn't a key here is treated as a literal HF id with no
 # special handling, so you can try any model without editing this dict.
 MODEL_PRESETS = {
@@ -67,18 +81,20 @@ DEFAULT_MODEL = "bge-m3"
 
 
 def resolve_model(name=DEFAULT_MODEL):
-    """Resolve a preset key (or raw HF id) to (hf_id, load_kwargs, doc_prefix).
+    """Resolve a preset key (or raw HF id) to (hf_id, load_kwargs, prefixes).
 
-    If `name` is a key in MODEL_PRESETS, its config is used; otherwise `name` is
-    treated as a literal Hugging Face model id with no special handling.
+    `prefixes` is (doc_prefix, query_prefix). If `name` is a key in
+    MODEL_PRESETS, its config is used; otherwise `name` is treated as a literal
+    Hugging Face model id with no special handling.
     """
     preset = MODEL_PRESETS.get(name)
     if preset is None:
-        return name, {}, ""
+        return name, {}, ("", "")
     load_kwargs = {}
     if preset.get("trust_remote_code"):
         load_kwargs["trust_remote_code"] = True
-    return preset["id"], load_kwargs, preset.get("doc_prefix", "")
+    return preset["id"], load_kwargs, (preset.get("doc_prefix", ""),
+                                       preset.get("query_prefix", ""))
 
 
 def load_inputs(path=DEFAULT_INPUT):
@@ -142,8 +158,9 @@ def get_model(name=DEFAULT_MODEL):
     """Load and return the sentence-transformer embedding model.
 
     `name` is a MODEL_PRESETS key (e.g. "bge-m3") or a literal HF model id. Any
-    document prefix the preset requires is stashed on the returned model as
-    `model.doc_prefix` so embed() can apply it transparently.
+    prefixes the preset requires are stashed on the returned model as
+    `model.doc_prefix` / `model.query_prefix` so embed() can apply the right one
+    transparently.
 
     The weights are loaded straight from the local HF cache when they're already
     there. Left to itself, SentenceTransformer round-trips to the Hugging Face
@@ -153,7 +170,7 @@ def get_model(name=DEFAULT_MODEL):
     """
     from sentence_transformers import SentenceTransformer   # see note at imports
 
-    hf_id, load_kwargs, doc_prefix = resolve_model(name)
+    hf_id, load_kwargs, (doc_prefix, query_prefix) = resolve_model(name)
     label = f"'{name}' ({hf_id})" if name != hf_id else f"'{hf_id}'"
     print(f"Loading embedding model {label}...")
     try:
@@ -164,6 +181,7 @@ def get_model(name=DEFAULT_MODEL):
         print(f"  {hf_id} not in the local cache: downloading (first run only)...")
         model = SentenceTransformer(hf_id, **load_kwargs)
     model.doc_prefix = doc_prefix
+    model.query_prefix = query_prefix
     model.hf_id = hf_id          # cache keys hash the resolved id, not the alias
     print(f"Model loaded on {model.device}. Embedding dimension = {get_dim(model)}")
     return model
@@ -228,7 +246,7 @@ def ensure_collection(client, dim, collection=DEFAULT_COLLECTION, reset=False):
     # the two together (see content_hash / fetch_cached).
     schema = client.create_schema(auto_id=True, enable_dynamic_field=True)
     schema.add_field("id", DataType.INT64, is_primary=True)
-    schema.add_field("text", DataType.VARCHAR, max_length=2048)
+    schema.add_field("text", DataType.VARCHAR, max_length=TEXT_MAX_BYTES)
     schema.add_field("chunk_hash", DataType.VARCHAR, max_length=64)
     schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=dim)
 
@@ -256,13 +274,22 @@ def ensure_collection(client, dim, collection=DEFAULT_COLLECTION, reset=False):
     return collection
 
 
-def embed(model, texts):
+def embed(model, texts, query=False):
     """Return normalized embeddings for a list of texts.
 
-    If the model was loaded with a document prefix (model.doc_prefix, set by
-    get_model for presets that require one), it is prepended to each text.
+    Any prefix the model was loaded with (set by get_model for presets that
+    require one) is prepended to each text: `model.doc_prefix` by default, or
+    `model.query_prefix` when `query=True`.
+
+    Passing `query=True` on the retrieval side is not cosmetic. Asymmetric
+    models -- nomic-embed, the E5 family -- are trained with *different* strings
+    on the two sides, and embedding a query as though it were a document still
+    returns a perfectly well-formed vector, just one placed in the wrong part of
+    the space. Nothing raises; recall simply drops, which is the hardest kind of
+    fault to notice in a retrieval system. Neither shipped preset sets a prefix,
+    so this is a trap for the next preset added rather than a live fault.
     """
-    prefix = getattr(model, "doc_prefix", "")
+    prefix = getattr(model, "query_prefix" if query else "doc_prefix", "")
     texts = [prefix + t for t in texts] if prefix else list(texts)
     return model.encode(texts, normalize_embeddings=True)
 
@@ -304,6 +331,67 @@ def fetch_cached(client, collection=DEFAULT_COLLECTION):
     return cached
 
 
+def live_row_count(client, collection=DEFAULT_COLLECTION):
+    """How many rows a query would actually return.
+
+    NOT `get_collection_stats()["row_count"]`. Milvus deletes are soft: the row
+    stops matching queries immediately but stays in its segment, and the stats
+    count keeps including it until a compaction runs -- which may be minutes
+    away, or never without an explicit `compact()`. So the two counts disagree
+    for an unbounded window after any delete, and code that compares one against
+    the other sees a shortfall that is not there.
+
+    `count(*)` is evaluated over live rows, which is the number every caller
+    here actually means. Falls back to the stats figure if the server is too old
+    to support it -- a slightly wrong number beats raising from a helper whose
+    whole job is to sanity-check someone else's numbers.
+    """
+    try:
+        return int(client.query(collection_name=collection,
+                                output_fields=["count(*)"])[0]["count(*)"])
+    except Exception:                     # noqa: BLE001 - fall back, never fatal
+        return int(client.get_collection_stats(collection)["row_count"])
+
+
+def text_capacity(client, collection=DEFAULT_COLLECTION):
+    """The collection's `text` byte capacity, or None if it cannot be read."""
+    try:
+        fields = {f["name"]: f
+                  for f in client.describe_collection(collection)["fields"]}
+        return fields["text"]["params"]["max_length"]
+    except Exception:                     # noqa: BLE001 - a guard, never fatal
+        return None
+
+
+def check_text_fits(client, rows, collection=DEFAULT_COLLECTION):
+    """Fail early and legibly when a chunk is too long for the `text` field.
+
+    Milvus's own error for this arrives mid-insert, names no chunk, and lands
+    after the embedding pass -- the expensive one -- leaving the collection
+    half-written. Since the limit is in bytes and every knob upstream counts
+    characters, what trips it is not an absurd setting but an ordinary one
+    applied to non-Latin text. Checking first costs one describe call.
+
+    A collection created before TEXT_MAX_BYTES was raised keeps its old capacity
+    until a `--reset` rebuild, so this reads the real limit rather than assuming
+    the current constant.
+    """
+    capacity = text_capacity(client, collection)
+    if not capacity:
+        return
+    for row in rows:
+        text = str(row.get("text", ""))
+        size = len(text.encode("utf-8"))
+        if size > capacity:
+            raise SystemExit(
+                f"A chunk is {size} bytes but the `text` field of "
+                f"'{collection}' holds {capacity}. Milvus counts VARCHAR in "
+                f"bytes while the chunker counts characters, so non-Latin text "
+                f"overflows well below the character limit you set. Re-ingest "
+                f"with --reset to rebuild the collection at {TEXT_MAX_BYTES} "
+                f"bytes, or lower --max-chars. The chunk starts: {text[:80]!r}")
+
+
 def insert_batched(client, rows, collection=DEFAULT_COLLECTION, batch=INSERT_BATCH):
     """Insert `rows` in batches, returning the total inserted.
 
@@ -313,6 +401,7 @@ def insert_batched(client, rows, collection=DEFAULT_COLLECTION, batch=INSERT_BAT
     Batching keeps every message comfortably under it, whatever the corpus size.
     """
     rows = list(rows)
+    check_text_fits(client, rows, collection)
     total = 0
     for i in range(0, len(rows), batch):
         result = client.insert(collection_name=collection, data=rows[i:i + batch])

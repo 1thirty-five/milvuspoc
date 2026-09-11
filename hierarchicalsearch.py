@@ -802,7 +802,8 @@ def hierarchical_search(client, model, query, allocation=DEFAULT_ALLOCATION,
     to a filtered search only for a cluster the pool did not cover to its quota.
     See the note in the stage-2 loop for why that is sound.
     """
-    query_vec = np.asarray(embed(model, [query])[0], dtype="float32")
+    query_vec = np.asarray(embed(model, [query], query=True)[0],
+                           dtype="float32")
     named = has_cluster_names(client, collection)
 
     scores, centroids, pool_scores = None, None, []

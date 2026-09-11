@@ -116,14 +116,47 @@ full OCR flag set), **Clustering** (KMeans, or edit `criteria.md` in place and
 run it), **Visualise** (UMAP inline), and **Collection** (schema, sources,
 cluster breakdown, row browser, benchmark, drop).
 
+Two things on **Search** worth pointing at:
+
+- The ⓘ beside the method name opens what that method actually computes — the
+  scoring formula, the constants it is pinned at, and which knobs move it. The
+  blurb says what a method is *for*; this says what it does, which is the half
+  that explains why two of them disagree on the same query.
+- Retrieval options are split into **Retrieval** (depth, `ef`, model, reranker —
+  these apply to every method) and **Weights**, which shows only the dial the
+  selected method actually has: `alpha` for `hybrid` and `weighted`, `lambda`
+  for `mmr`, and a note for the four that rank on a single signal and so have
+  nothing to balance. The sliders keep their values while another method is
+  selected, which they would not by default — Streamlit drops a keyed widget's
+  state on any run that does not render it.
+
+**Visualise** colours by cluster and carries the source document on the marker
+*shape*, with both in the hover along with the chunk's position in its file. A
+cluster is a region of embedding space, not a region of a file, so on a
+multi-document corpus its members routinely come from several — the *Which
+documents feed each cluster* table underneath gives the split, which the scatter
+cannot show once colour is spent on the cluster.
+
 > Streamlit binds `0.0.0.0` by default and prints an external URL. Add
 > `--server.address localhost` if you don't want it reachable from your network.
 
 The UI is a thin layer over the same functions the CLIs call — see
 `milvusui/runner.py` for how modules that `print()` and `raise SystemExit` are
-adapted to it. One thing worth knowing: the backend caches are process-lifetime,
-so if you change the collection from a terminal while the server is running, hit
-**Refresh caches** in the sidebar.
+adapted to it.
+
+The backend caches are process-lifetime, so a collection changed from a terminal
+would otherwise go unnoticed. The sidebar polls a cheap fingerprint every 5s and
+invalidates when it moves, so an ingest or re-clustering run from a shell shows
+up on its own; **Refresh caches** is the manual path for what the fingerprint
+cannot see — a criterion file edited on disk, a model swapped in the HF cache.
+
+> The version counter that keys those caches lives in an `st.cache_resource`
+> box, not a module global, and that is not incidental. Streamlit reloads
+> modules on any edit to a project file, which resets a global to zero while the
+> `cache_data` entries keyed on the versions it already issued survive — so the
+> counter reissues version 0 and every page answers with the snapshot taken at
+> server start. It looks exactly like a broken poll. `cache_resource` survives
+> the reload, so a spent version is never handed out twice.
 
 ## Ingesting documents
 
@@ -227,6 +260,7 @@ python search.py "multi-head attention"                          # hybrid (defau
 python search.py "multi-head attention" --method lexical
 python search.py "scaled dot-product" --method hybrid --rerank
 python search.py "attention" --method weighted --alpha 0.7
+python search.py "WMT 2014" --method hybrid --alpha 0.3       # lean lexical
 python search.py "attention" --method mmr --lambda 0.5 --k 5
 python search.py "how is risk handled?" --method hierarchical
 ```
@@ -238,10 +272,24 @@ Seven techniques, chosen with `--method`:
 | `dense` | Embeds the query, ANN search over the HNSW index (cosine). | Meaning, paraphrase. Weak on exact tokens. |
 | `lexical` | BM25 over the stored text. No model, no vectors. | Exact terms (codes, names, "WMT 2014"). Blind to paraphrase. |
 | `tfidf` | TF-IDF cosine — the classic lexical baseline. | A simpler keyword contrast to BM25. |
-| `hybrid` **(default)** | Runs dense + lexical, fuses by Reciprocal Rank Fusion. | The strong default: semantic recall + keyword precision. |
-| `weighted` | Weighted sum of min-max-normalized dense & lexical scores. | When you want an explicit dial (`--alpha`) instead of RRF. |
+| `hybrid` **(default)** | Runs dense + lexical, fuses by Reciprocal Rank Fusion. `--alpha` weights the two sides. | The strong default: semantic recall + keyword precision. |
+| `weighted` | Weighted sum of min-max-normalized dense & lexical scores, same `--alpha`. | When you want the dial on the **scores** rather than on the rank positions. |
 | `mmr` | Dense, then Maximal Marginal Relevance re-selection. | Avoiding near-duplicate results (`--lambda`). |
 | `hierarchical` | Ranks the **clusters** against the query, then takes 5/4/3/2/1 chunks from the top five. | Broad or exploratory queries: guarantees coverage of five regions instead of 15 hits from one. Needs cluster labels. |
+
+`hybrid` and `weighted` share `--alpha`, and it means the same thing on both —
+how much of the answer the dense side gets — but it acts on different machinery,
+so the same alpha on the same query does **not** give the same ranking:
+
+- `hybrid` weights each side's **rank contribution**, `w / (60 + rank)`. The raw
+  cosine and BM25 scores never enter the sum, which is exactly why two
+  incomparable scales can be fused at all. `--alpha 0.5` is the classic
+  parameter-free RRF, byte for byte.
+- `weighted` weights the **scores** themselves, after min-max normalising each
+  list into [0, 1] so they are addable.
+
+Reach for `hybrid` by default and `weighted` when you want the score gaps, not
+just the ordering, to count.
 
 Add `--rerank` to any method: a cross-encoder re-scores the shortlist by reading
 the query and each chunk **together**, then keeps the top `--k`. More accurate
@@ -252,7 +300,7 @@ ordering, at the cost of a model pass per candidate.
 | `--k N` | `5` | Results returned. |
 | `--candidates N` | `50` | Shortlist depth retrieved before fusing/reranking. |
 | `--ef N` | `max(64, candidates)` | HNSW search width. Higher = better recall, slower. |
-| `--alpha F` | `0.5` | `weighted` only. `1.0` = all dense, `0` = all lexical. |
+| `--alpha F` | `0.5` | `hybrid` and `weighted`. `1.0` = all dense, `0` = all lexical. |
 | `--lambda F` | `0.5` | `mmr` only. `1.0` = pure relevance, `0` = pure diversity. |
 | `--allocation a,b,c` | `5,4,3,2,1` | `hierarchical` only. Chunks taken from the 1st, 2nd, … ranked cluster. |
 | `--rerank-model <id>` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Cross-encoder to rerank with. |
@@ -577,9 +625,15 @@ python loadmilvus.py --model minilm   # lighter, faster cold start
 
 Any other `--model` value is used as a literal Hugging Face id, so you can try a
 model without adding a preset. `MILVUS_MODEL` sets the default instead of the
-flag. Presets live in `MODEL_PRESETS` in `loadmilvus.py`; an optional
-`doc_prefix` / `trust_remote_code` per preset covers models that need them (e.g.
-nomic-embed).
+flag. Presets live in `MODEL_PRESETS` in `loadmilvus.py`; the optional keys
+`trust_remote_code`, `doc_prefix` and `query_prefix` cover models that need them.
+
+> If you add a preset for an **asymmetric** model — nomic-embed, the E5 family —
+> set both prefixes. Those models are trained with different strings on the two
+> sides (`search_document: ` vs `search_query: `), and embedding a query as
+> though it were a document still returns a perfectly well-formed vector, just
+> one placed in the wrong part of the space. Nothing raises; recall quietly
+> drops. `embed(model, texts, query=True)` is what the retrieval paths call.
 
 There is a single `documents` collection, rebuilt each run at the chosen model's
 dimension, so **switching models replaces the stored data** — only one model's
@@ -609,7 +663,7 @@ is not measured.
 | Field | Type | Notes |
 |-------|------|-------|
 | `id` | `INT64` | Primary key, auto-generated. |
-| `text` | `VARCHAR(2048)` | The document or chunk. |
+| `text` | `VARCHAR(65535)` | The document or chunk. See the note below. |
 | `embedding` | `FLOAT_VECTOR(dim)` | L2-normalized. `dim` follows the model. |
 | `source` | dynamic | Filename, set by `extractpdf.py`. |
 | `cluster` | dynamic | KMeans label, set by `cluster.py` / `customcluster.py`. |
@@ -619,6 +673,23 @@ is not measured.
 Indexed with **HNSW** (`M=16`, `efConstruction=200`) on **COSINE**, matching the
 normalized embeddings — so scores are cosine similarity and `ef` tunes recall at
 query time.
+
+> **`text` is sized in bytes, and the chunker counts characters.** The two agree
+> only on ASCII. At the old 2048 a CJK document overflowed at the *default*
+> 600-character chunk size — three bytes per character puts a full chunk near
+> 3600 — and Milvus rejected the insert after the embedding pass had been paid
+> for. The field is now the format's maximum, and `insert_batched` checks the
+> collection's real capacity before writing so an over-long chunk fails early
+> with a message naming it. A collection created before this keeps its old
+> capacity until a `--reset` rebuild.
+
+> **Deletes are soft.** A deleted row stops matching queries immediately but
+> stays in its segment, and `get_collection_stats()["row_count"]` keeps counting
+> it until a compaction runs. Anything that needs "how many rows are there"
+> calls `loadmilvus.live_row_count()`, which asks for `count(*)` instead — the
+> guard in `cluster.fetch_all` compares against it, and comparing against the
+> stats figure instead made clustering refuse to run for an unbounded window
+> after any delete.
 
 ## Files
 
@@ -635,7 +706,8 @@ query time.
 | `benchmark.py` | Measure the storing pipeline → `statistics.md`. |
 | `app.py` | Streamlit front-end. Page registration and the connection check only. |
 | `milvusui/` | The UI: `runner.py` (adapts print/SystemExit), `resources.py` (cached client, models, collection state), `components.py` (shared widgets), `views/` (one module per page). |
-| `test_ui.py` | Headless render + interaction test for every page (`python test_ui.py`). |
+| `test_ui.py` | Headless render + interaction test for every page (`python test_ui.py`). Needs Milvus up. |
+| `test_customcluster.py` | Offline tests for the criterion path — stubbed model and Milvus, synthetic vectors with known structure (`python test_customcluster.py`). |
 | `input.md` | Documents to index (bullets under `# Documents`). |
 | `fileinput/` | Drop PDFs here for `extractpdf.py`. Contents git-ignored. |
 | `docker-compose.yml` | Milvus standalone + its named data volume. |

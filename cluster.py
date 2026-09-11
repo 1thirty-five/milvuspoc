@@ -32,6 +32,7 @@ import numpy as np
 from sklearn.cluster import KMeans
 
 from loadmilvus import (DEFAULT_COLLECTION, DEFAULT_RESULT, INSERT_BATCH, connect,
+                        live_row_count,
                         ensure_collection, insert_batched)
 
 # Default cluster count. input.md holds 10 topical groups of ~10 docs each, so
@@ -131,7 +132,13 @@ def fetch_all(client, collection=DEFAULT_COLLECTION, batch_size=INSERT_BATCH):
     finally:
         iterator.close()
 
-    expected = client.get_collection_stats(collection)["row_count"]
+    # Live count, not the stats figure: see live_row_count. Measured here --
+    # deleting 7 rows left stats reporting 134 against 127 real ones, and this
+    # guard then blocked every clustering run until a compaction happened to
+    # come along. The guard is right to exist (store_labels rebuilds from what
+    # this returns, so a short read is silent data loss) but it has to be
+    # comparing against a number that means the same thing as len(rows).
+    expected = live_row_count(client, collection)
     if len(rows) != expected:
         raise SystemExit(
             f"Read {len(rows)} rows but '{collection}' holds {expected}. "
@@ -249,6 +256,17 @@ def write_result_labels(rows, labels, path=DEFAULT_RESULT):
     dim = namespace.get("dim")
 
     label_by_text = {row["text"]: int(label) for row, label in zip(rows, labels)}
+
+    # Nothing matched at all -> this result.py was generated from a different
+    # corpus than the one just clustered. Rewriting it would replace whatever
+    # labels it holds with a column of None, destroying the earlier run's output
+    # to record that this run knows nothing about it. Leave the file alone and
+    # say why; the fix is to regenerate it, which is not this function's job.
+    if entries and not any(entry["text"] in label_by_text for entry in entries):
+        print(f"Skipping {path}: none of its {len(entries)} entries are in the "
+              f"collection that was just clustered, so it describes a different "
+              f"corpus. Regenerate it with `python loadmilvus.py --full`.")
+        return
 
     missing = 0
     with open(result_path, "w", encoding="utf-8") as f:

@@ -870,7 +870,17 @@ def _overlap_sentences(sentences, overlap):
                 break
             kept.insert(0, word)
             used += len(word) + 1
-        return [" ".join(kept)] if kept else []
+        carry = " ".join(kept)
+        # Clipping on a word boundary silently does nothing to a script that has
+        # no word boundaries. Chinese, Japanese and Thai split() into a single
+        # "word", the loop keeps it whole, and the duplication measured above
+        # comes straight back -- at the 600-char default a CJK page produced
+        # chunks of 1201 characters, each carrying its predecessor entire.
+        # There is no word boundary to preserve here, so preserving one is not a
+        # constraint being honoured, it is a guard that has quietly turned off.
+        if len(carry) > overlap:
+            carry = carry[-overlap:]
+        return [carry] if carry else []
     return tail
 
 

@@ -18,7 +18,8 @@ st.set_page_config(page_title="Milvus retrieval", page_icon="🔎",
                    layout="wide", initial_sidebar_state="expanded")
 
 from milvusui.resources import (collection_fingerprint, collection_info,          # noqa: E402
-                                connection_error, data_version, invalidate)
+                                connection_error, data_version, invalidate,
+                                source_breakdown)
 from milvusui.views import (clustering, collection, compare, ingest, search,     # noqa: E402
                             visualize)
 
@@ -71,12 +72,28 @@ def collection_summary():
         st.rerun(scope="app")
 
     info = collection_info(data_version())
-    if info.get("exists"):
-        st.caption(f"**{info['rows']:,}** chunks · **{info['dim']}**-dim"
-                   + (f" · `{info['scheme']}`" if info.get("scheme") else "")
-                   + ("" if info.get("clustered") else " · unclustered"))
-    else:
+    if not info.get("exists"):
         st.caption("No collection yet.")
+        return
+
+    # Which documents are loaded, before how many pieces they were cut into.
+    # A bare chunk count says how much is stored without saying what it is,
+    # which is the one thing you want confirmed before running a search.
+    sources = source_breakdown(data_version())
+    if len(sources) == 1:
+        st.caption(f"**{sources[0][0]}**")
+    elif sources:
+        st.caption(f"**{len(sources)}** documents")
+        with st.expander("Which"):
+            for name, count in sources:
+                st.caption(f"{name} · {count:,}")
+
+    # The criterion name is deliberately not here. It is a slug chosen when the
+    # clustering was run, it goes stale the moment the corpus is replaced, and a
+    # wrong one on every page is worse than none -- the Collection page shows it
+    # next to the clusters it actually describes.
+    st.caption(f"{info['rows']:,} chunks · {info['dim']}-dim"
+               + ("" if info.get("clustered") else " · unclustered"))
 
 
 def sidebar():
@@ -92,7 +109,11 @@ def sidebar():
             st.caption("Then wait for `healthy` in `docker compose ps`.")
             return False
 
-        st.success("Connected")
+        # A caption, not st.success: connected is the normal state and the
+        # sidebar shows it on every page, so a full green banner spends the
+        # eye's attention on the least surprising thing on screen. The failure
+        # path below stays loud, because that one is worth interrupting for.
+        st.caption(":green[●] Connected")
         collection_summary()
 
         st.divider()

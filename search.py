@@ -13,9 +13,11 @@ Six techniques, selectable with `--method`, plus an optional reranker on top:
               simpler, purely term-frequency alternative to BM25).
     hybrid    run dense AND lexical, then fuse with Reciprocal Rank Fusion (RRF,
               rank-based). The strong default — semantic recall + keyword precision.
+              `--alpha` weights the two sides (1.0 = all dense, 0 = all lexical);
+              the default 0.5 is the classic even-handed RRF.
     weighted  hybrid via weighted SUM of min-max-normalized dense & lexical
-              scores; tune the balance with `--alpha` (1.0 = all dense, 0 = all
-              lexical). Use when you want an explicit dial instead of RRF.
+              scores, tuned by the same `--alpha`. Use when you want the dial on
+              the scores themselves rather than on the rank positions.
     mmr       dense retrieval + Maximal Marginal Relevance: greedily pick results
               that are relevant to the query but DIVERSE from each other, so the
               top-k aren't near-duplicates. Balance with `--lambda` (1.0 = pure
@@ -47,6 +49,7 @@ Run (PowerShell):
     .venv\\Scripts\\python.exe search.py "multi-head attention" --method lexical
     .venv\\Scripts\\python.exe search.py "scaled dot-product" --method hybrid --rerank
     .venv\\Scripts\\python.exe search.py "attention" --method weighted --alpha 0.7
+    .venv\\Scripts\\python.exe search.py "WMT 2014" --method hybrid --alpha 0.3
     .venv\\Scripts\\python.exe search.py "attention" --method mmr --lambda 0.5 --k 5
     .venv\\Scripts\\python.exe search.py "risk" --method hierarchical --allocation 5,4,3,2,1
     .venv\\Scripts\\python.exe search.py "BLEU score" --method dense --model minilm --k 3
@@ -78,7 +81,9 @@ DEFAULT_RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 # flattens the contribution of top ranks, smaller sharpens it.
 RRF_K = 60
 
-# Weighted-fusion default: dense-vs-lexical weight (1.0 = all dense, 0 = all lexical).
+# Dense-vs-lexical weight for `hybrid` and `weighted` (1.0 = all dense, 0 = all
+# lexical). 0.5 is an even split, which is what both methods did before the dial
+# reached `hybrid` -- so the default changes nothing for either.
 DEFAULT_ALPHA = 0.5
 
 # MMR default: relevance-vs-diversity trade-off (1.0 = pure relevance, 0 = pure diversity).
@@ -110,7 +115,7 @@ def dense_search(client, model, query, limit, ef, collection=DEFAULT_COLLECTION,
     similarity).
     """
     client.load_collection(collection)
-    query_vec = embed(model, [query])[0].tolist()
+    query_vec = embed(model, [query], query=True)[0].tolist()
     fields = ["text", "source", "seq"] + (["embedding"] if with_vectors else [])
     hits = client.search(
         collection_name=collection,
@@ -193,19 +198,56 @@ def lexical_search(corpus, query, limit):
     return [{**row, "score": float(score)} for row, score in ranked[:limit]]
 
 
-def reciprocal_rank_fusion(ranked_lists, limit, rrf_k=RRF_K):
+def rrf_weights(weights, count):
+    """Normalize `weights` to average 1.0 across `count` lists, or None.
+
+    A common factor across every list cannot reorder anything, so the scale is
+    free -- and picking "average 1.0" is what makes an even split reproduce the
+    unweighted fusion exactly, scores included. Without it a 50/50 hybrid would
+    report half the score it always has for an identical ranking, which reads as
+    a regression in every saved result and benchmark.
+    """
+    if weights is None:
+        return None
+    weights = [float(w) for w in weights]
+    if len(weights) != count:
+        raise SystemExit(
+            f"Fusion needs one weight per ranked list: got {len(weights)} "
+            f"weight(s) for {count} list(s).")
+    if any(w < 0 for w in weights):
+        raise SystemExit(f"Fusion weights cannot be negative; got {weights}.")
+    total = sum(weights)
+    if total <= 0:
+        raise SystemExit("Fusion weights cannot all be zero -- that would "
+                         "score every candidate 0 and rank them arbitrarily.")
+    return [w * count / total for w in weights]
+
+
+def reciprocal_rank_fusion(ranked_lists, limit, rrf_k=RRF_K, weights=None):
     """Fuse several ranked record lists into one by Reciprocal Rank Fusion.
 
-    Each list contributes 1/(rrf_k + rank) per document (rank is 1-based within
-    that list); scores are summed across lists by document id. RRF needs only
-    the rank positions, not the (incomparable) raw dense/BM25 scores, which is
-    why it fuses cleanly across different retrievers. Returns the top `limit`.
+    Each list contributes weight/(rrf_k + rank) per document (rank is 1-based
+    within that list); scores are summed across lists by document id. RRF needs
+    only the rank positions, not the (incomparable) raw dense/BM25 scores, which
+    is why it fuses cleanly across different retrievers. Returns the top `limit`.
+
+    `weights` is one multiplier per list, for a caller that trusts one retriever
+    more than another on this query -- `hybrid` passes (alpha, 1 - alpha) so the
+    same dial that drives `weighted` drives it too. Omit it and every list counts
+    equally, which is the classic parameter-free RRF.
+
+    The dial moves *rank* influence, not score: a weight scales what a document's
+    position in that list is worth, and the raw dense cosine and BM25 scores stay
+    out of the arithmetic entirely. That is the difference from weighted_fusion,
+    which dials the normalized scores themselves.
     """
+    weights = rrf_weights(weights, len(ranked_lists))
     fused = {}
-    for records in ranked_lists:
+    for index, records in enumerate(ranked_lists):
+        weight = 1.0 if weights is None else weights[index]
         for rank, rec in enumerate(records, start=1):
             slot = fused.setdefault(rec["id"], {"record": rec, "score": 0.0})
-            slot["score"] += 1.0 / (rrf_k + rank)
+            slot["score"] += weight / (rrf_k + rank)
     ordered = sorted(fused.values(), key=lambda s: s["score"], reverse=True)
     return [{**s["record"], "score": s["score"]} for s in ordered[:limit]]
 
@@ -282,7 +324,8 @@ def mmr_search(client, model, query, limit, pool, ef, lambda_mult=DEFAULT_LAMBDA
     if not candidates:
         return []
     vectors = [np.asarray(c["vector"], dtype="float32") for c in candidates]
-    query_vec = np.asarray(embed(model, [query])[0], dtype="float32")
+    query_vec = np.asarray(embed(model, [query], query=True)[0],
+                           dtype="float32")
     relevance = [float(query_vec @ v) for v in vectors]
 
     selected, remaining = [], list(range(len(candidates)))
@@ -353,7 +396,11 @@ def search(client, query, method, model_name, k, candidates, ef,
     elif method == "hybrid":
         dense = dense_search(client, _embedder(), query, candidates, ef)
         lexical = lexical_search(fetch_corpus(client), query, candidates)
-        results = reciprocal_rank_fusion([dense, lexical], depth)
+        # Same alpha as `weighted`, applied to the rank contributions rather
+        # than to normalized scores. alpha=0.5 is the unweighted RRF this
+        # method has always run, byte for byte.
+        results = reciprocal_rank_fusion([dense, lexical], depth,
+                                         weights=[alpha, 1.0 - alpha])
     elif method == "weighted":
         dense = dense_search(client, _embedder(), query, candidates, ef)
         lexical = lexical_search(fetch_corpus(client), query, candidates)
@@ -483,7 +530,7 @@ def main():
     rerank_model = parse_flag_value(sys.argv, "--rerank-model", DEFAULT_RERANK_MODEL)
     # HNSW search width must be >= how many candidates we ask for.
     ef = int(parse_flag_value(sys.argv, "--ef", max(64, candidates)))
-    alpha = float(parse_flag_value(sys.argv, "--alpha", DEFAULT_ALPHA))       # weighted
+    alpha = float(parse_flag_value(sys.argv, "--alpha", DEFAULT_ALPHA))  # hybrid/weighted
     lambda_mult = float(parse_flag_value(sys.argv, "--lambda", DEFAULT_LAMBDA))  # mmr
     # Full text by default; --preview N truncates when scanning many results.
     preview_arg = parse_flag_value(sys.argv, "--preview")
